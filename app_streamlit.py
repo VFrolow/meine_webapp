@@ -1,5 +1,7 @@
 # main.py
 import os
+import csv
+import io
 import bcrypt
 import streamlit as st
 from sqlalchemy import create_engine, text
@@ -7,9 +9,9 @@ from sqlalchemy.exc import IntegrityError
 
 st.set_page_config(page_title="Login + Admin", layout="wide")
 
-# -----------------------------
-#   DB-Verbindung
-# -----------------------------
+# =========================================================
+#  DB-Verbindung
+# =========================================================
 DB_URL = st.secrets.get("db", {}).get("url") or os.getenv("DATABASE_URL")
 if not DB_URL:
     st.error("DATABASE_URL fehlt. In Render → Service → Environment setzen.")
@@ -17,9 +19,9 @@ if not DB_URL:
 
 engine = create_engine(DB_URL, pool_pre_ping=True)
 
-# -----------------------------
-#   Schema / Migration
-# -----------------------------
+# =========================================================
+#  Schema / Migration
+# =========================================================
 with engine.begin() as conn:
     conn.execute(text("""
         CREATE TABLE IF NOT EXISTS users (
@@ -29,7 +31,7 @@ with engine.begin() as conn:
             created_at TIMESTAMP DEFAULT NOW()
         )
     """))
-    # Falls ältere Tabelle ohne 'role' existiert → Spalte hinzufügen
+    # Falls 'role' in Altbestand fehlt → hinzufügen
     conn.execute(text("""
         DO $$
         BEGIN
@@ -42,11 +44,10 @@ with engine.begin() as conn:
         END $$;
     """))
 
-# -----------------------------
-#   Hilfsfunktionen
-# -----------------------------
+# =========================================================
+#  Hilfsfunktionen (DB + Auth)
+# =========================================================
 def _to_bytes(v):
-    # BYTEA kann als bytes oder memoryview zurückkommen
     return v.tobytes() if hasattr(v, "tobytes") else v
 
 def hash_password(pw: str) -> bytes:
@@ -122,9 +123,9 @@ def delete_user(username: str):
         conn.execute(text("DELETE FROM users WHERE username=:u"), {"u": username})
     return True, "Benutzer gelöscht."
 
-# -----------------------------
-#   Seed-Admin (idempotent)
-# -----------------------------
+# =========================================================
+#  Seed-Admin (idempotent) + optionale Elevation
+# =========================================================
 SEED_ADMIN_USER = os.getenv("SEED_ADMIN_USER")
 SEED_ADMIN_PASS = os.getenv("SEED_ADMIN_PASS")
 if SEED_ADMIN_USER and SEED_ADMIN_PASS:
@@ -138,12 +139,55 @@ if SEED_ADMIN_USER and SEED_ADMIN_PASS:
                 text("INSERT INTO users (username, pwd_hash, role) VALUES (:u, :h, 'admin')"),
                 {"u": SEED_ADMIN_USER, "h": hash_password(SEED_ADMIN_PASS)}
             )
-            # print statt st.write (keine UI-Verschmutzung)
             print(f"Seed-Admin '{SEED_ADMIN_USER}' wurde angelegt.")
 
-# -----------------------------
-#   Seiten
-# -----------------------------
+# Einmalige Hochstufung per Env (optional; danach Env entfernen)
+ELEVATE_USER = os.getenv("ELEVATE_USER")
+if ELEVATE_USER:
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE users SET role='admin' WHERE username=:u"),
+                     {"u": ELEVATE_USER})
+        print(f"User '{ELEVATE_USER}' wurde zu admin erhöht.")
+
+# =========================================================
+#  Debug-Panel (aktiv via ?debug=1 oder DEBUG_AUTH=1)
+# =========================================================
+def debug_enabled() -> bool:
+    if os.getenv("DEBUG_AUTH") == "1":
+        return True
+    try:
+        # Streamlit ≥ 1.30
+        if "debug" in st.query_params and str(st.query_params["debug"]) in ("1", "true", "True"):
+            return True
+    except Exception:
+        pass
+    return False
+
+def debug_panel():
+    if not debug_enabled():
+        return
+    st.sidebar.markdown("### 🧪 Auth-Debug")
+    # DB-Probe
+    ok = False
+    err = None
+    try:
+        with engine.begin() as c:
+            c.execute(text("SELECT 1"))
+        ok = True
+    except Exception as e:
+        err = str(e)
+    st.sidebar.write("DB-Verbindung:", "✅" if ok else f"❌ ({err})")
+    # Nutzerübersicht
+    try:
+        data = list_users()
+        st.sidebar.write("Users in DB:", len(data))
+        st.sidebar.write("Beispiele:", [{"username": u["username"], "role": u["role"]} for u in data[:10]])
+    except Exception as e:
+        st.sidebar.error(f"users-Check: {e}")
+
+# =========================================================
+#  Seiten
+# =========================================================
 def page_home():
     st.title("🏠 Home")
     st.write(f"Eingeloggt als **{st.session_state['user']}**")
@@ -165,52 +209,74 @@ def is_admin_current_user() -> bool:
 def page_admin():
     st.title("🛠️ Admin – Benutzerverwaltung")
 
-    users = list_users()
-    if not users:
-        st.info("Keine Benutzer vorhanden.")
-        return
-
-    for row in users:
-        col1, col2, col3, col4, col5 = st.columns([3,2,3,3,3])
-        col1.write(f"**{row['username']}**")
-        col2.write(row['role'])
-        col3.write(row['created_at'])
-
-        # Passwort setzen
-        with col4:
-            with st.popover("Passwort setzen", use_container_width=True):
-                new_pw = st.text_input(f"Neues Passwort für {row['username']}",
-                                       type="password", key=f"pw_{row['username']}")
-                if st.button("Speichern", key=f"pwbtn_{row['username']}"):
-                    if new_pw:
-                        set_user_password(row['username'], new_pw)
-                        st.success("Passwort aktualisiert.")
-                    else:
-                        st.error("Bitte Passwort eingeben.")
-
-        # Löschen
-        with col5:
-            if st.button("Löschen", key=f"del_{row['username']}"):
-                ok, msg = delete_user(row['username'])
-                st.toast(msg, icon="✅" if ok else "⚠️")
-                st.rerun()
-
-    st.markdown("---")
-    # Rolle ändern
-    st.subheader("Rolle ändern")
-    sel = st.selectbox("Benutzer", [u["username"] for u in users])
-    role = st.radio("Rolle", ["user", "admin"], horizontal=True)
-    if st.button("Rolle speichern"):
-        if sel == st.session_state.get("user") and role != "admin":
-            st.error("Du kannst dir nicht selbst Admin entziehen.")
+    tabs = st.tabs(["👥 Benutzer", "🗂️ DB-Viewer"])
+    # ------------ Tab 1: Benutzerverwaltung ------------
+    with tabs[0]:
+        users = list_users()
+        if not users:
+            st.info("Keine Benutzer vorhanden.")
         else:
-            set_user_role(sel, role)
-            st.success("Rolle aktualisiert.")
-            st.rerun()
+            for row in users:
+                col1, col2, col3, col4, col5 = st.columns([3,2,3,3,3])
+                col1.write(f"**{row['username']}**")
+                col2.write(row['role'])
+                col3.write(row['created_at'])
 
-# -----------------------------
-#   Auth Views
-# -----------------------------
+                with col4:
+                    with st.popover("Passwort setzen", use_container_width=True):
+                        new_pw = st.text_input(
+                            f"Neues Passwort für {row['username']}",
+                            type="password", key=f"pw_{row['username']}"
+                        )
+                        if st.button("Speichern", key=f"pwbtn_{row['username']}"):
+                            if new_pw:
+                                set_user_password(row['username'], new_pw)
+                                st.success("Passwort aktualisiert.")
+                            else:
+                                st.error("Bitte Passwort eingeben.")
+
+                with col5:
+                    if st.button("Löschen", key=f"del_{row['username']}"):
+                        ok, msg = delete_user(row['username'])
+                        st.toast(msg, icon="✅" if ok else "⚠️")
+                        st.rerun()
+
+            st.markdown("---")
+            st.subheader("Rolle ändern")
+            sel = st.selectbox("Benutzer", [u["username"] for u in users])
+            role = st.radio("Rolle", ["user", "admin"], horizontal=True)
+            if st.button("Rolle speichern"):
+                if sel == st.session_state.get("user") and role != "admin":
+                    st.error("Du kannst dir nicht selbst Admin entziehen.")
+                else:
+                    set_user_role(sel, role)
+                    st.success("Rolle aktualisiert.")
+                    st.rerun()
+
+    # ------------ Tab 2: DB-Viewer (read-only + CSV) ------------
+    with tabs[1]:
+        data = list_users()
+        st.write(f"**Anzahl Benutzer:** {len(data)}")
+        if data:
+            # Tabelle anzeigen
+            st.dataframe(data, use_container_width=True)
+            # CSV-Download
+            csv_buf = io.StringIO()
+            writer = csv.DictWriter(csv_buf, fieldnames=["username", "role", "created_at"])
+            writer.writeheader()
+            writer.writerows(data)
+            st.download_button(
+                "CSV exportieren",
+                data=csv_buf.getvalue().encode("utf-8"),
+                file_name="users.csv",
+                mime="text/csv"
+            )
+        else:
+            st.info("Keine Daten.")
+
+# =========================================================
+#  Auth Views
+# =========================================================
 def login_view():
     st.header("🔑 Login")
     u = st.text_input("Benutzername")
@@ -237,10 +303,12 @@ def register_view():
             ok, msg = add_user(u, p1, "user")
             st.success(msg) if ok else st.error(msg)
 
-# -----------------------------
-#   App
-# -----------------------------
+# =========================================================
+#  App
+# =========================================================
 def app():
+    debug_panel()  # Debug-Infos in der Sidebar (via ?debug=1 oder DEBUG_AUTH=1)
+
     st.session_state.setdefault("logged_in", False)
     st.session_state.setdefault("page", "Home")
 
@@ -268,7 +336,6 @@ def app():
             st.session_state.clear()
             st.rerun()
 
-    # Routing
     if st.session_state["page"] == "Home":
         page_home()
     elif st.session_state["page"] == "Auswertung":
