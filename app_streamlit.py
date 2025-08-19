@@ -1,3 +1,4 @@
+# main.py
 import os
 import bcrypt
 import streamlit as st
@@ -6,14 +7,19 @@ from sqlalchemy.exc import IntegrityError
 
 st.set_page_config(page_title="Login + Admin", layout="wide")
 
+# -----------------------------
+#   DB-Verbindung
+# -----------------------------
 DB_URL = st.secrets.get("db", {}).get("url") or os.getenv("DATABASE_URL")
 if not DB_URL:
-    st.error("DATABASE_URL fehlt. In Render unter Environment setzen.")
+    st.error("DATABASE_URL fehlt. In Render → Service → Environment setzen.")
     st.stop()
 
 engine = create_engine(DB_URL, pool_pre_ping=True)
 
-# --- Schema/Migration ---
+# -----------------------------
+#   Schema / Migration
+# -----------------------------
 with engine.begin() as conn:
     conn.execute(text("""
         CREATE TABLE IF NOT EXISTS users (
@@ -23,6 +29,7 @@ with engine.begin() as conn:
             created_at TIMESTAMP DEFAULT NOW()
         )
     """))
+    # Falls ältere Tabelle ohne 'role' existiert → Spalte hinzufügen
     conn.execute(text("""
         DO $$
         BEGIN
@@ -35,13 +42,20 @@ with engine.begin() as conn:
         END $$;
     """))
 
+# -----------------------------
+#   Hilfsfunktionen
+# -----------------------------
+def _to_bytes(v):
+    # BYTEA kann als bytes oder memoryview zurückkommen
+    return v.tobytes() if hasattr(v, "tobytes") else v
+
 def hash_password(pw: str) -> bytes:
     return bcrypt.hashpw(pw.encode("utf-8"), bcrypt.gensalt())
 
 def check_password(pw: str, pw_hash: bytes) -> bool:
     return bcrypt.checkpw(pw.encode("utf-8"), pw_hash)
 
-def add_user(username: str, password: str, role: str = "user") -> tuple[bool, str]:
+def add_user(username: str, password: str, role: str = "user"):
     if not username or not password:
         return False, "Benutzername/Passwort fehlt."
     try:
@@ -60,9 +74,9 @@ def get_user_hash(username: str):
             text("SELECT pwd_hash FROM users WHERE username=:u"),
             {"u": username}
         ).fetchone()
-    if not row: return None
-    h = row[0]
-    return h.tobytes() if hasattr(h, "tobytes") else h
+    if not row:
+        return None
+    return _to_bytes(row[0])
 
 def get_user(username: str):
     with engine.begin() as conn:
@@ -89,31 +103,47 @@ def set_user_password(username: str, new_pw: str):
 def set_user_role(username: str, role: str):
     assert role in ("user", "admin")
     with engine.begin() as conn:
-        conn.execute(text("UPDATE users SET role=:r WHERE username=:u"), {"r": role, "u": username})
+        conn.execute(text("UPDATE users SET role=:r WHERE username=:u"),
+                     {"r": role, "u": username})
 
-def delete_user(username: str) -> tuple[bool, str]:
+def delete_user(username: str):
     me = st.session_state.get("user")
     if username == me:
         return False, "Du kannst dich nicht selbst löschen."
     with engine.begin() as conn:
-        role_row = conn.execute(text("SELECT role FROM users WHERE username=:u"), {"u": username}).fetchone()
+        role_row = conn.execute(text("SELECT role FROM users WHERE username=:u"),
+                                {"u": username}).fetchone()
         if not role_row:
             return False, "Benutzer existiert nicht."
-        is_admin_target = role_row[0] == "admin"
-        if is_admin_target:
+        if role_row[0] == "admin":
             admin_count = conn.execute(text("SELECT COUNT(*) FROM users WHERE role='admin'")).scalar()
             if admin_count <= 1:
                 return False, "Letzten Admin darfst du nicht löschen."
         conn.execute(text("DELETE FROM users WHERE username=:u"), {"u": username})
     return True, "Benutzer gelöscht."
 
-# Seed-Admin (optional)
+# -----------------------------
+#   Seed-Admin (idempotent)
+# -----------------------------
 SEED_ADMIN_USER = os.getenv("SEED_ADMIN_USER")
 SEED_ADMIN_PASS = os.getenv("SEED_ADMIN_PASS")
 if SEED_ADMIN_USER and SEED_ADMIN_PASS:
-    add_user(SEED_ADMIN_USER, SEED_ADMIN_PASS, role="admin")
+    with engine.begin() as conn:
+        exists = conn.execute(
+            text("SELECT 1 FROM users WHERE username=:u"),
+            {"u": SEED_ADMIN_USER}
+        ).fetchone()
+        if not exists:
+            conn.execute(
+                text("INSERT INTO users (username, pwd_hash, role) VALUES (:u, :h, 'admin')"),
+                {"u": SEED_ADMIN_USER, "h": hash_password(SEED_ADMIN_PASS)}
+            )
+            # print statt st.write (keine UI-Verschmutzung)
+            print(f"Seed-Admin '{SEED_ADMIN_USER}' wurde angelegt.")
 
-# --- Seiten ---
+# -----------------------------
+#   Seiten
+# -----------------------------
 def page_home():
     st.title("🏠 Home")
     st.write(f"Eingeloggt als **{st.session_state['user']}**")
@@ -137,7 +167,7 @@ def page_admin():
 
     users = list_users()
     if not users:
-        st.info("Keine Benutzer.")
+        st.info("Keine Benutzer vorhanden.")
         return
 
     for row in users:
@@ -145,15 +175,20 @@ def page_admin():
         col1.write(f"**{row['username']}**")
         col2.write(row['role'])
         col3.write(row['created_at'])
+
+        # Passwort setzen
         with col4:
             with st.popover("Passwort setzen", use_container_width=True):
-                new_pw = st.text_input(f"Neues Passwort für {row['username']}", type="password", key=f"pw_{row['username']}")
+                new_pw = st.text_input(f"Neues Passwort für {row['username']}",
+                                       type="password", key=f"pw_{row['username']}")
                 if st.button("Speichern", key=f"pwbtn_{row['username']}"):
                     if new_pw:
                         set_user_password(row['username'], new_pw)
                         st.success("Passwort aktualisiert.")
                     else:
                         st.error("Bitte Passwort eingeben.")
+
+        # Löschen
         with col5:
             if st.button("Löschen", key=f"del_{row['username']}"):
                 ok, msg = delete_user(row['username'])
@@ -161,6 +196,7 @@ def page_admin():
                 st.rerun()
 
     st.markdown("---")
+    # Rolle ändern
     st.subheader("Rolle ändern")
     sel = st.selectbox("Benutzer", [u["username"] for u in users])
     role = st.radio("Rolle", ["user", "admin"], horizontal=True)
@@ -172,7 +208,9 @@ def page_admin():
             st.success("Rolle aktualisiert.")
             st.rerun()
 
-# --- Auth Views ---
+# -----------------------------
+#   Auth Views
+# -----------------------------
 def login_view():
     st.header("🔑 Login")
     u = st.text_input("Benutzername")
@@ -199,6 +237,9 @@ def register_view():
             ok, msg = add_user(u, p1, "user")
             st.success(msg) if ok else st.error(msg)
 
+# -----------------------------
+#   App
+# -----------------------------
 def app():
     st.session_state.setdefault("logged_in", False)
     st.session_state.setdefault("page", "Home")
@@ -214,9 +255,12 @@ def app():
         menu = ["Home", "Auswertung", "Settings"]
         if is_admin_current_user():
             menu.append("Admin")
-        choice = st.radio("Menü", options=menu,
-                          index=menu.index(st.session_state["page"]) if st.session_state["page"] in menu else 0,
-                          label_visibility="collapsed")
+        choice = st.radio(
+            "Menü",
+            options=menu,
+            index=menu.index(st.session_state["page"]) if st.session_state["page"] in menu else 0,
+            label_visibility="collapsed"
+        )
         st.session_state["page"] = choice
         st.markdown("---")
         st.caption(f"Eingeloggt als **{st.session_state['user']}**")
@@ -224,6 +268,7 @@ def app():
             st.session_state.clear()
             st.rerun()
 
+    # Routing
     if st.session_state["page"] == "Home":
         page_home()
     elif st.session_state["page"] == "Auswertung":
