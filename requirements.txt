@@ -1,5 +1,4 @@
 streamlit
-os
 sqlalchemy
 psycopg2-binary
 bcrypt
