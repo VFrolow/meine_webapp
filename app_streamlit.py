@@ -12,7 +12,7 @@ st.set_page_config(page_title="Login + Admin", layout="wide")
 # =========================================================
 #  DB-Verbindung
 # =========================================================
-DB_URL = st.secrets.get("db", {}).get("url") or os.getenv("DATABASE_URL")
+DB_URL = os.getenv("DATABASE_URL") or st.secrets.get("db", {}).get("url")
 if not DB_URL:
     st.error("DATABASE_URL fehlt. In Render → Service → Environment setzen.")
     st.stop()
@@ -349,3 +349,4 @@ def app():
 
 if __name__ == "__main__":
     app()
+
