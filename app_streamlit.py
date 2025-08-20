@@ -306,6 +306,35 @@ def register_view():
 # =========================================================
 #  App
 # =========================================================
+
+def debug_enabled() -> bool:
+    if os.getenv("DEBUG_AUTH") == "1":
+        return True
+    try:
+        if "debug" in st.query_params and str(st.query_params["debug"]) in ("1","true","True"):
+            return True
+    except Exception:
+        pass
+    return False
+
+def debug_panel():
+    if not debug_enabled():
+        return
+    st.sidebar.markdown("### 🧪 Auth-Debug")
+    # Quelle der DB-URL anzeigen
+    src = "env:DATABASE_URL" if os.getenv("DATABASE_URL") else ("secrets.toml" if st.secrets.get("db", {}).get("url") else "—")
+    st.sidebar.write("DB-URL Quelle:", src)
+    # Users auflisten
+    try:
+        with engine.begin() as c:
+            n = c.execute(text("SELECT COUNT(*) FROM users")).scalar()
+            st.sidebar.write("Users in DB:", n)
+            rows = c.execute(text("SELECT username, role FROM users ORDER BY username LIMIT 10")).fetchall()
+            st.sidebar.write("Beispiele:", [dict(r._mapping) for r in rows] if rows else "—")
+    except Exception as e:
+        st.sidebar.error(f"DB-Check: {e}")
+
+
 def app():
     debug_panel()  # Debug-Infos in der Sidebar (via ?debug=1 oder DEBUG_AUTH=1)
 
@@ -349,4 +378,5 @@ def app():
 
 if __name__ == "__main__":
     app()
+
 
