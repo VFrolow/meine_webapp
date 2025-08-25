@@ -354,7 +354,7 @@ def user_analyzer(root: Path) -> dict:
 
     # rowSyncs: für jede tatsächliche Zeile ein Eintrag
     max_row = len(sorted_jobs)
-    out["rowSyncs"] = [{"rowNumber": i, "syncs": [[1, 2, 3]]} for i in range(1, max_row + 1)]
+    out["rowSyncs"] = [{"rowNumber": i, "syncs": [[1,2,3]]} for i in range(1, max_row + 1)]
     return out
 
 
@@ -662,6 +662,7 @@ def app():
 
 if __name__ == "__main__":
     app()
+
 
 
 
