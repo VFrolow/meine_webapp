@@ -278,8 +278,9 @@ def page_admin():
 
                 with col6:
                     if st.button("Löschen", key=f"del_{row['username']}"):
-                        ok, msg = delete_user(row['username"])
-                        st.toast(msg, icon="✅" if ok else "⚠️"); st.rerun()
+                        ok, msg = delete_user(row['username'])
+                        st.toast(msg, icon="✅" if ok else "⚠️")
+                        st.rerun()
 
             st.markdown("---")
             st.subheader("Rolle ändern")
@@ -370,3 +371,4 @@ def app():
 
 if __name__ == "__main__":
     app()
+
