@@ -184,11 +184,9 @@ def get_settings():
 # =========================================================
 def user_analyzer(root: Path) -> dict:
     """
-    Analysiert rekursiv alle Dateien im entpackten ZIP und erzeugt camExportInfo.json
-    - erkennt Programme an Dateinamen: ^L([12])(\\d+)(?:\\.[A-Za-z0-9]+)?$
-      z.B. L1101.SPF, L2101, L1102.txt
-    - bildet Zeilen (rowNumber) aus der gemeinsamen Job-Nummer (Ziffern hinter L1/L2)
-    - nutzt deine Settings (NPV, KI, asynchron, Werkzeugname, Schneidennummer)
+    Analysiert rekursiv alle Dateien, berücksichtigt aber NUR Programme:
+      L1(101..199) / L2(101..199)  -> z.B. L1101, L2101, L1102, L2102, ...
+    Alles andere wird ignoriert.
     """
     s = get_settings()
     npv_hs = s["npv_hs"].upper().strip()
@@ -215,46 +213,46 @@ def user_analyzer(root: Path) -> dict:
         "rowSyncs": [],
     }
 
-    # ---------------- Patterns / Regeln (wie zuvor) ----------------
+    # Verbots-/Prüflisten & KI wie zuvor
     verboten_npv = [";", "E_CON", "TCARR", "MSG", "TCTOOL", "CALL", "HEAD", "PS_", "GROUP_BEGIN", "F_CON"]
     verboten_end = [";", "MSG"]
     prg_end_opt  = ["M17", "M30", "RET"]
-
     rx_prefix_npv = re.compile(r"^\s*(?:" + "|".join(map(re.escape, verboten_npv)) + r")", re.I)
     rx_prefix_end = re.compile(r"^\s*(?:" + "|".join(map(re.escape, verboten_end)) + r")", re.I)
     rx_end        = re.compile(r"^\s*(?:" + "|".join(map(re.escape, prg_end_opt)) + r")(?!\d)", re.I)
 
-    # KI-Merkmale
     merkmale_hs = ["M814", "SETMS(4)", "L707", "SPOS[4]", "C4", "S4", "M4"]
     merkmale_gs = ["M813", "SETMS(3)", "L705", "SPOS[3]", "C3", "S3", "M3"]
     rx_ki_hs    = re.compile(r"^\s*(?:" + "|".join(map(re.escape, merkmale_hs)) + r")(?!\d)", re.I)
     rx_ki_gs    = re.compile(r"^\s*(?:" + "|".join(map(re.escape, merkmale_gs)) + r")(?!\d)", re.I)
 
-    # ---------------- Kandidaten rekursiv einsammeln ----------------
-    # Map: job_num (int) -> { "1": Path, "2": Path }
-    jobs: dict[int, dict[str, Path]] = {}
+    # ---------------- NUR L1/2 + 101..199 zulassen ----------------
+    # Regex erzwingt: L, Kanal 1/2, und genau drei Ziffern beginnend mit 1 (=> 1xx)
+    rx_progname = re.compile(r'^L([12])(1\d{2})(?:\.[A-Za-z0-9]+)?$', re.IGNORECASE)
 
+    # Map: job_num -> { "1": Path, "2": Path }
+    jobs: dict[int, dict[str, Path]] = {}
     for p in root.rglob("*"):
         if not p.is_file():
             continue
-        m = re.match(r'^L([12])(\d+)(?:\.[A-Za-z0-9]+)?$', p.name, re.IGNORECASE)
+        m = rx_progname.match(p.name)
         if not m:
             continue
-        chan = m.group(1)                 # "1" oder "2"
-        job_num = int(m.group(2))         # z.B. 101 (aus L1101 → 101)
+        chan = m.group(1)               # "1" oder "2"
+        job_num = int(m.group(2))       # 101..199
+        if not (101 <= job_num <= 199):
+            continue  # hart filtern
         jobs.setdefault(job_num, {})
-        # Bevorzugt Top-Level? – wenn mehrere gleichnamige auftauchen, erste nehmen
-        jobs[job_num].setdefault(chan, p)
+        jobs[job_num].setdefault(chan, p)  # erstes Vorkommen nehmen
 
     if not jobs:
-        # nichts gefunden → leeres Grundgerüst zurück
         return out
 
-    # ---------------- Reihen (rowNumber) aus Job-Nummern bilden ----------------
-    sorted_jobs = sorted(jobs.keys())             # z.B. [101, 102, 103, ...]
-    row_for_job = {num: idx+1 for idx, num in enumerate(sorted_jobs)}  # 1..N
+    # Reihen/rowNumber aus den vorhandenen Job-Nummern
+    sorted_jobs = sorted(jobs.keys())  # z.B. [101, 102, ...]
+    row_for_job = {num: idx+1 for idx, num in enumerate(sorted_jobs)}
 
-    # ---------------- Dateien pro Zeile verarbeiten ----------------
+    # ---------------- Dateien je Job verarbeiten ----------------
     for job_num in sorted_jobs:
         row_nr = row_for_job[job_num]
 
@@ -272,7 +270,7 @@ def user_analyzer(root: Path) -> dict:
             except Exception:
                 lines = []
 
-            # opName (Kommentar in erster Zeile – ; oder MSG)
+            # opName
             op_name = "no comment"
             if lines:
                 if comment_token == ";" and ";" in lines[0]:
@@ -284,18 +282,18 @@ def user_analyzer(root: Path) -> dict:
                     elif ";" in lines[0]:
                         op_name = lines[0].split(";", 1)[1].strip()
 
-            # Werkzeugname (T=...)
+            # Werkzeugname
             toolname = ""
             if want_tool:
                 for raw in lines:
-                    if rx_prefix_npv.search(raw):  # verbotene Präfixe überspringen
+                    if rx_prefix_npv.search(raw):
                         continue
                     m_t = re.search(r'T\s*=\s*(.*)', raw, re.I)
                     if m_t:
                         toolname = m_t.group(1).rstrip("\r\n").replace('"', "")
                         break
 
-            # Schneidennummer (TC(...))
+            # Schneidennummer
             cutting_edge = 0
             if want_edge:
                 for raw in lines:
@@ -306,48 +304,38 @@ def user_analyzer(root: Path) -> dict:
                         cutting_edge = int(m_e.group(1))
                         break
 
-            # Spindelzuordnung: NPV + KI + Ende-Erkennung
+            # Spindelzuordnung
             gxx = 99
             g54_found = False
             g55_found = False
             ki_hs_hit = False
             ki_gs_hit = False
 
-            seq = lines[max(1, start_idx):]  # ab "Suchen ab"
-
+            seq = lines[max(1, start_idx):]
             for zeile in seq:
                 up = zeile.upper()
-                # Programm-Ende?
-                if rx_end.search(up):
-                    if not rx_prefix_end.search(up):
-                        break
-                # NPV: G54/G55 (konfigurierbar)
-                if re.search(re.escape(npv_hs), up):
-                    if not rx_prefix_npv.search(up):
-                        g54_found = True; gxx = 4; break
-                if re.search(re.escape(npv_gs), up):
-                    if not rx_prefix_npv.search(up):
-                        g55_found = True; gxx = 3; break
-                # KI-Hints
+                if rx_end.search(up) and not rx_prefix_end.search(up):
+                    break
+                if re.search(re.escape(npv_hs), up) and not rx_prefix_npv.search(up):
+                    g54_found = True; gxx = 4; break
+                if re.search(re.escape(npv_gs), up) and not rx_prefix_npv.search(up):
+                    g55_found = True; gxx = 3; break
                 if use_ki:
                     if rx_ki_hs.search(up) and not rx_prefix_end.search(up):
                         ki_hs_hit = True
                     if rx_ki_gs.search(up) and not rx_prefix_end.search(up):
                         ki_gs_hit = True
 
-            # KI-Heuristik falls NPV nicht gefunden
             if use_ki and not (g54_found or g55_found):
                 if   ki_hs_hit and not ki_gs_hit: gxx = 4
                 elif ki_gs_hit and not ki_hs_hit: gxx = 3
 
-            # Asynchron/Fallback
             if gxx == 99 and use_async:
                 gxx = 4 if chan_no == "1" else 3
             if gxx == 99:
                 gxx = 0
 
-            # ID und fileName
-            stem_id = f"L{chan_no}{job_num}"  # z.B. "L1101" / "L2101" (ohne Endung)
+            stem_id = f"L{chan_no}{job_num}"  # z.B. L1101/L2101
             out["programs"].append({
                 "opName": op_name,
                 "fileName": match_path.name,
@@ -364,10 +352,11 @@ def user_analyzer(root: Path) -> dict:
                 },
             })
 
-    # ---------------- rowSyncs für ALLE Zeilen ----------------
+    # rowSyncs: für jede tatsächliche Zeile ein Eintrag
     max_row = len(sorted_jobs)
     out["rowSyncs"] = [{"rowNumber": i, "syncs": [[1, 2, 3]]} for i in range(1, max_row + 1)]
     return out
+
 
 
 # =========================================================
@@ -674,4 +663,5 @@ def app():
 
 if __name__ == "__main__":
     app()
+
 
