@@ -415,12 +415,11 @@ def page_home():
 
             st.download_button(
                 "📥 camExportInfo.json herunterladen",
-                data=json.dumps(result, indent=2, ensure_ascii=False).encode("utf-8"),
+                data=json.dumps(result, indent=2, ensure_ascii=False, separators=(',', ':')).encode("utf-8"),
                 file_name="camExportInfo.json",
                 mime="application/json",
                 use_container_width=True
             )
-
         except Exception as e:
             st.error(f"Fehler beim Verarbeiten des ZIP: {e}")
 
@@ -663,5 +662,6 @@ def app():
 
 if __name__ == "__main__":
     app()
+
 
 
