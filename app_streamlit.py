@@ -409,9 +409,50 @@ def page_home():
                     "row": p.get("position",{}).get("rowNumber",0),
                 })
             if rows:
-                st.dataframe(rows, use_container_width=True)
+                # Programme nach rowNumber gruppieren
+                by_row = {}
+                for p in result["programs"]:
+                    r = p["position"]["rowNumber"]
+                    by_row.setdefault(r, []).append(p)
+            
+                # Kopfzeile
+                c_sp4_k1, c_sp4_k2, c_sp3_k1, c_sp3_k2 = st.columns(4)
+                with c_sp4_k1: st.subheader("🌀 Spindel 4 – Kanal 1")
+                with c_sp4_k2: st.subheader("🌀 Spindel 4 – Kanal 2")
+                with c_sp3_k1: st.subheader("🌀 Spindel 3 – Kanal 1")
+                with c_sp3_k2: st.subheader("🌀 Spindel 3 – Kanal 2")
+            
+                # Zeilen nacheinander
+                for row_nr in sorted(by_row.keys()):
+                    progs = by_row[row_nr]
+                    sp4_k1 = [p for p in progs if p["position"]["channelNumber"] == 1 and p["position"]["spindleNumber"] == 4]
+                    sp4_k2 = [p for p in progs if p["position"]["channelNumber"] == 2 and p["position"]["spindleNumber"] == 4]
+                    sp3_k1 = [p for p in progs if p["position"]["channelNumber"] == 1 and p["position"]["spindleNumber"] == 3]
+                    sp3_k2 = [p for p in progs if p["position"]["channelNumber"] == 2 and p["position"]["spindleNumber"] == 3]
+            
+                    c_sp4_k1, c_sp4_k2, c_sp3_k1, c_sp3_k2 = st.columns(4)
+            
+                    def render_ops(col, ops):
+                        for op in ops:
+                            col.markdown(
+                                f"""
+                                <div style="background-color:#f5f5f5; border:1px solid #ddd; 
+                                            padding:8px; border-radius:8px; margin-bottom:8px;">
+                                    <b>Row {op['position']['rowNumber']}</b> – {op['opName']}<br>
+                                    <small>📄 {op['fileName']}<br>
+                                    🛠️ {op['tool']['toolName']} / Schneide {op['tool']['cuttingEdgeNo']}</small>
+                                </div>
+                                """,
+                                unsafe_allow_html=True
+                            )
+            
+                    render_ops(c_sp4_k1, sp4_k1)
+                    render_ops(c_sp4_k2, sp4_k2)
+                    render_ops(c_sp3_k1, sp3_k1)
+                    render_ops(c_sp3_k2, sp3_k2)
             else:
                 st.info("Keine Programme gefunden.")
+
 
             st.download_button(
                 "📥 camExportInfo.json herunterladen",
@@ -662,6 +703,7 @@ def app():
 
 if __name__ == "__main__":
     app()
+
 
 
 
