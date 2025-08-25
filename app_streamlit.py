@@ -423,50 +423,47 @@ def page_home():
                 for p in result["programs"]:
                     r = p["position"]["rowNumber"]
                     by_row.setdefault(r, []).append(p)
-
-                # Kopfzeile – Zeile 1 (Spindeln)
-                c_sp4, c_sp3 = st.columns(2)
-                with c_sp4:
-                    st.markdown("<h3 style='text-align:center;'>🌀 Spindel 4</h3>", unsafe_allow_html=True)
-                with c_sp3:
-                    st.markdown("<h3 style='text-align:center;'>🌀 Spindel 3</h3>", unsafe_allow_html=True)
-
-                # Kopfzeile – Zeile 2 (Kanäle unter jeder Spindel)
-                c_sp4_k1, c_sp4_k2, c_sp3_k1, c_sp3_k2 = st.columns(4)
-                with c_sp4_k1:
-                    st.markdown("<h4 style='text-align:center;'>Kanal 1</h4>", unsafe_allow_html=True)
-                with c_sp4_k2:
-                    st.markdown("<h4 style='text-align:center;'>Kanal 2</h4>", unsafe_allow_html=True)
-                with c_sp3_k1:
-                    st.markdown("<h4 style='text-align:center;'>Kanal 1</h4>", unsafe_allow_html=True)
-                with c_sp3_k2:
-                    st.markdown("<h4 style='text-align:center;'>Kanal 2</h4>", unsafe_allow_html=True)
-
-                # Karten-Renderer (dunkler Rahmen, schwarze Schrift)
+            
+                # Kopfzeilen
+                c_idx, c_sp4, c_sp3 = st.columns([0.3, 2, 2])
+                with c_idx: st.markdown("<h3 style='text-align:center;'>#</h3>", unsafe_allow_html=True)
+                with c_sp4: st.markdown("<h3 style='text-align:center;'>🌀 Spindel 4</h3>", unsafe_allow_html=True)
+                with c_sp3: st.markdown("<h3 style='text-align:center;'>🌀 Spindel 3</h3>", unsafe_allow_html=True)
+            
+                c_idx, c_sp4_k1, c_sp4_k2, c_sp3_k1, c_sp3_k2 = st.columns([0.3, 1, 1, 1, 1])
+                with c_sp4_k1: st.markdown("<h4 style='text-align:center;'>Kanal 1</h4>", unsafe_allow_html=True)
+                with c_sp4_k2: st.markdown("<h4 style='text-align:center;'>Kanal 2</h4>", unsafe_allow_html=True)
+                with c_sp3_k1: st.markdown("<h4 style='text-align:center;'>Kanal 1</h4>", unsafe_allow_html=True)
+                with c_sp3_k2: st.markdown("<h4 style='text-align:center;'>Kanal 2</h4>", unsafe_allow_html=True)
+            
+                # Karten-Renderer
                 def render_ops(col, ops):
                     for op in ops:
+                        edge = op['tool']['cuttingEdgeNo']
+                        edge_str = f"D{edge}" if edge else ""
                         col.markdown(
                             f"""
                             <div style="background-color:#ffffff; border:2px solid #444;
-                                        padding:10px; border-radius:8px; margin-bottom:10px; color:#000;">
-                                <b>Row {op['position']['rowNumber']}</b> – {op['opName']}<br>
-                                <small>📄 {op['fileName']}<br>
-                                🛠️ {op['tool']['toolName']} / Schneide {op['tool']['cuttingEdgeNo']}</small>
+                                        padding:10px; border-radius:8px; margin-bottom:10px;
+                                        min-height:100px; color:#000; display:flex; flex-direction:column; justify-content:center;">
+                                <b>{op['opName']}</b><br>
+                                <small>🛠️ {op['tool']['toolName']} {edge_str}</small>
                             </div>
                             """,
                             unsafe_allow_html=True
                         )
-
+            
                 # Alle Zeilen rendern
-                for row_nr in sorted(by_row.keys()):
+                for idx, row_nr in enumerate(sorted(by_row.keys()), start=1):
                     progs = by_row[row_nr]
-                    # je Spindel/Kanal filtern
                     sp4_k1 = [p for p in progs if p["position"]["spindleNumber"] == 4 and p["position"]["channelNumber"] == 1]
                     sp4_k2 = [p for p in progs if p["position"]["spindleNumber"] == 4 and p["position"]["channelNumber"] == 2]
                     sp3_k1 = [p for p in progs if p["position"]["spindleNumber"] == 3 and p["position"]["channelNumber"] == 1]
                     sp3_k2 = [p for p in progs if p["position"]["spindleNumber"] == 3 and p["position"]["channelNumber"] == 2]
-
-                    c_sp4_k1, c_sp4_k2, c_sp3_k1, c_sp3_k2 = st.columns(4)
+            
+                    c_idx, c_sp4_k1, c_sp4_k2, c_sp3_k1, c_sp3_k2 = st.columns([0.3, 1, 1, 1, 1])
+                    with c_idx:
+                        st.markdown(f"<div style='text-align:center; font-weight:bold; margin-top:20px;'>{idx}</div>", unsafe_allow_html=True)
                     render_ops(c_sp4_k1, sp4_k1)
                     render_ops(c_sp4_k2, sp4_k2)
                     render_ops(c_sp3_k1, sp3_k1)
@@ -726,6 +723,7 @@ def app():
 
 if __name__ == "__main__":
     app()
+
 
 
 
