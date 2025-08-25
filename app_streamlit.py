@@ -436,8 +436,9 @@ def page_home():
                         for op in ops:
                             col.markdown(
                                 f"""
-                                <div style="background-color:#f5f5f5; border:1px solid #ddd; 
-                                            padding:8px; border-radius:8px; margin-bottom:8px;">
+                                <div style="background-color:#ffffff; border:2px solid #444; 
+                                            padding:10px; border-radius:8px; margin-bottom:10px;
+                                            color:#000;">
                                     <b>Row {op['position']['rowNumber']}</b> – {op['opName']}<br>
                                     <small>📄 {op['fileName']}<br>
                                     🛠️ {op['tool']['toolName']} / Schneide {op['tool']['cuttingEdgeNo']}</small>
@@ -703,6 +704,7 @@ def app():
 
 if __name__ == "__main__":
     app()
+
 
 
 
