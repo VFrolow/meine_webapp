@@ -441,13 +441,25 @@ def page_home():
                     for op in ops:
                         edge = op['tool']['cuttingEdgeNo']
                         edge_str = f"D{edge}" if edge else ""
+                        op_name_full = op['opName'] or ""
+                        tool_line_full = f"{op['tool']['toolName']} {edge_str}".strip()
+                
                         col.markdown(
                             f"""
                             <div style="background-color:#ffffff; border:2px solid #444;
                                         padding:10px; border-radius:8px; margin-bottom:10px;
-                                        min-height:100px; color:#000; display:flex; flex-direction:column; justify-content:center;">
-                                <b>{op['opName']}</b><br>
-                                <small>🛠️ {op['tool']['toolName']} {edge_str}</small>
+                                        min-height:100px; max-height:100px;
+                                        color:#000; display:flex; flex-direction:column; justify-content:center;">
+                                <div title="{op_name_full}"
+                                     style="font-weight:bold; font-size:14px;
+                                            white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
+                                    {op_name_full}
+                                </div>
+                                <div title="{tool_line_full}"
+                                     style="font-size:12px; color:#333;
+                                            white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
+                                    🛠️ {tool_line_full}
+                                </div>
                             </div>
                             """,
                             unsafe_allow_html=True
@@ -723,6 +735,7 @@ def app():
 
 if __name__ == "__main__":
     app()
+
 
 
 
