@@ -250,25 +250,31 @@ def change_password_form(show_current: bool = False):
 
 def page_admin():
     st.title("🛠️ Admin – Benutzerverwaltung")
+
     tabs = st.tabs(["👥 Benutzerliste", "➕ Benutzer anlegen (Temp-PW)"])
 
-    # Liste + Aktionen
+    # ===================== TAB 1: BENUTZERLISTE =====================
     with tabs[0]:
         users = list_users()
         if not users:
             st.info("Keine Benutzer vorhanden.")
         else:
+            # Zeilenanzeige mit Passwort-Setzen (ohne Zwang) und Inline-Löschen (optional)
             for row in users:
                 col1, col2, col3, col4, col5, col6 = st.columns([3,2,3,3,3,2])
                 col1.write(f"**{row['username']}**")
                 col2.write(row['role'])
-                col3.write("🔁 Wechsel nötig" if row['must_change_password'] else "✅ gesetzt")
-                col4.write(row['created_at'])
+                col3.write("🔁 Wechsel nötig" if row.get('must_change_password') else "✅ gesetzt")
+                col4.write(row.get('created_at'))
 
+                # Passwort setzen (ohne must_change zurückzusetzen)
                 with col5:
-                    with st.popover("Passwort setzen (ohne Zwang)", use_container_width=True):
-                        new_pw = st.text_input(f"Neues Passwort für {row['username']}",
-                                               type="password", key=f"pw_{row['username']}")
+                    with st.popover("Passwort setzen", use_container_width=True):
+                        new_pw = st.text_input(
+                            f"Neues Passwort für {row['username']}",
+                            type="password",
+                            key=f"pw_{row['username']}"
+                        )
                         if st.button("Speichern", key=f"pwbtn_{row['username']}"):
                             if new_pw:
                                 ok, msg = set_user_password(row['username'], new_pw, clear_must_change=False)
@@ -276,31 +282,61 @@ def page_admin():
                             else:
                                 st.error("Bitte Passwort eingeben.")
 
+                # (Optional) Inline-Löschen – sicherer ist die Danger Zone unten
                 with col6:
-                    if st.button("Löschen", key=f"del_{row['username']}"):
+                    if st.button("Löschen", key=f"del_inline_{row['username']}"):
                         ok, msg = delete_user(row['username'])
-                        st.toast(msg, icon="✅" if ok else "⚠️")
-                        st.rerun()
+                        if ok:
+                            st.success(msg)
+                            st.rerun()
+                        else:
+                            st.warning(msg)
 
             st.markdown("---")
+            # Rollen ändern
             st.subheader("Rolle ändern")
-            if users:
-                sel = st.selectbox("Benutzer", [u["username"] for u in users])
-                role = st.radio("Rolle", ["user", "admin"], horizontal=True)
-                if st.button("Rolle speichern"):
-                    if sel == st.session_state.get("user") and role != "admin":
-                        st.error("Du kannst dir nicht selbst Admin entziehen.")
-                    else:
-                        set_user_role(sel, role); st.success("Rolle aktualisiert."); st.rerun()
+            sel_user = st.selectbox("Benutzer", [u["username"] for u in users], key="role_sel_user")
+            sel_role = st.radio("Rolle", ["user", "admin"], horizontal=True, key="role_sel_role")
+            if st.button("Rolle speichern", key="save_role_btn"):
+                if sel_user == st.session_state.get("user") and sel_role != "admin":
+                    st.error("Du kannst dir nicht selbst Admin entziehen.")
+                else:
+                    set_user_role(sel_user, sel_role)
+                    st.success("Rolle aktualisiert.")
+                    st.rerun()
 
-    # Anlegen mit Temp-PW + Zwangswechsel
+            st.markdown("---")
+            # ===================== DANGER ZONE: SICHERES LÖSCHEN =====================
+            st.subheader("🗑️ Danger Zone – Benutzer löschen")
+            del_user = st.selectbox(
+                "Benutzer auswählen",
+                [u["username"] for u in users],
+                key="danger_del_user"
+            )
+            c1, c2 = st.columns([1, 3])
+            with c1:
+                confirm = st.checkbox("Ich bestätige das Löschen", key="danger_del_confirm")
+            with c2:
+                if st.button("Benutzer endgültig löschen", type="primary", key="danger_del_btn"):
+                    if not confirm:
+                        st.error("Bitte erst die Checkbox bestätigen.")
+                    else:
+                        ok, msg = delete_user(del_user)
+                        if ok:
+                            st.success(msg)
+                            st.rerun()
+                        else:
+                            st.warning(msg)
+
+    # ===================== TAB 2: NEUEN BENUTZER ANLEGEN =====================
     with tabs[1]:
         st.info("Neuer Nutzer bekommt ein temporäres Passwort und muss es beim ersten Login ändern.")
         nu = st.text_input("Benutzername (neu)", key="admin_new_user")
         npw1 = st.text_input("Temporäres Passwort", type="password", key="admin_new_pw1")
         npw2 = st.text_input("Temporäres Passwort (wiederholen)", type="password", key="admin_new_pw2")
         nrole = st.radio("Rolle", ["user", "admin"], horizontal=True, index=0, key="admin_new_role")
-        if st.button("Benutzer erstellen"):
+
+        if st.button("Benutzer erstellen", key="admin_create_user_btn"):
             if not nu or not npw1:
                 st.error("Bitte Benutzername & Passwort eingeben.")
             elif npw1 != npw2:
@@ -308,7 +344,8 @@ def page_admin():
             else:
                 ok, msg = add_user(nu, npw1, nrole, must_change=True)
                 st.success(msg) if ok else st.error(msg)
-                if ok: st.rerun()
+                if ok:
+                    st.rerun()
 
 # =========================================================
 #  Login / App
@@ -371,4 +408,5 @@ def app():
 
 if __name__ == "__main__":
     app()
+
 
