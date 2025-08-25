@@ -370,11 +370,14 @@ def page_home():
     uploaded_zip = st.file_uploader("📦 Ordner als ZIP hochladen", type=["zip"], accept_multiple_files=False)
     if uploaded_zip is not None:
         try:
+            # --- ZIP in /tmp/<user>/ entpacken ---
             tmp_dir = Path("/tmp") / f"user_{st.session_state['user']}"
             if tmp_dir.exists():
                 for p in tmp_dir.rglob("*"):
-                    try: p.unlink()
-                    except IsADirectoryError: pass
+                    try:
+                        p.unlink()
+                    except IsADirectoryError:
+                        pass
             tmp_dir.mkdir(parents=True, exist_ok=True)
 
             zip_path = tmp_dir / "uploaded.zip"
@@ -384,21 +387,26 @@ def page_home():
             extract_dir = tmp_dir / "extracted"
             if extract_dir.exists():
                 for p in extract_dir.rglob("*"):
-                    try: p.unlink()
-                    except IsADirectoryError: pass
+                    try:
+                        p.unlink()
+                    except IsADirectoryError:
+                        pass
             extract_dir.mkdir(parents=True, exist_ok=True)
 
+            import zipfile
             with zipfile.ZipFile(zip_path, "r") as z:
                 z.extractall(extract_dir)
 
+            # --- Analyzer starten (nutzt deine Settings) ---
             with st.spinner("Analysiere Dateien mit deinen Settings…"):
                 result = user_analyzer(extract_dir)
 
             st.success("camExportInfo.json erzeugt ✅")
 
-            # Vorschau-Tabelle (ohne pandas)
+            # --- Vorschau strukturiert darstellen (Spindel 4/3 x Kanal 1/2) ---
+            programs = result.get("programs", [])
             rows = []
-            for p in result.get("programs", []):
+            for p in programs:
                 rows.append({
                     "opName": p.get("opName",""),
                     "fileName": p.get("fileName",""),
@@ -408,45 +416,57 @@ def page_home():
                     "edge": p.get("tool",{}).get("cuttingEdgeNo",0),
                     "row": p.get("position",{}).get("rowNumber",0),
                 })
+
             if rows:
                 # Programme nach rowNumber gruppieren
                 by_row = {}
                 for p in result["programs"]:
                     r = p["position"]["rowNumber"]
                     by_row.setdefault(r, []).append(p)
-            
-                # Kopfzeile
+
+                # Kopfzeile – Zeile 1 (Spindeln)
+                c_sp4, c_sp3 = st.columns(2)
+                with c_sp4:
+                    st.markdown("<h3 style='text-align:center;'>🌀 Spindel 4</h3>", unsafe_allow_html=True)
+                with c_sp3:
+                    st.markdown("<h3 style='text-align:center;'>🌀 Spindel 3</h3>", unsafe_allow_html=True)
+
+                # Kopfzeile – Zeile 2 (Kanäle unter jeder Spindel)
                 c_sp4_k1, c_sp4_k2, c_sp3_k1, c_sp3_k2 = st.columns(4)
-                with c_sp4_k1: st.subheader("🌀 Spindel 4 – Kanal 1")
-                with c_sp4_k2: st.subheader("🌀 Spindel 4 – Kanal 2")
-                with c_sp3_k1: st.subheader("🌀 Spindel 3 – Kanal 1")
-                with c_sp3_k2: st.subheader("🌀 Spindel 3 – Kanal 2")
-            
-                # Zeilen nacheinander
+                with c_sp4_k1:
+                    st.markdown("<h4 style='text-align:center;'>Kanal 1</h4>", unsafe_allow_html=True)
+                with c_sp4_k2:
+                    st.markdown("<h4 style='text-align:center;'>Kanal 2</h4>", unsafe_allow_html=True)
+                with c_sp3_k1:
+                    st.markdown("<h4 style='text-align:center;'>Kanal 1</h4>", unsafe_allow_html=True)
+                with c_sp3_k2:
+                    st.markdown("<h4 style='text-align:center;'>Kanal 2</h4>", unsafe_allow_html=True)
+
+                # Karten-Renderer (dunkler Rahmen, schwarze Schrift)
+                def render_ops(col, ops):
+                    for op in ops:
+                        col.markdown(
+                            f"""
+                            <div style="background-color:#ffffff; border:2px solid #444;
+                                        padding:10px; border-radius:8px; margin-bottom:10px; color:#000;">
+                                <b>Row {op['position']['rowNumber']}</b> – {op['opName']}<br>
+                                <small>📄 {op['fileName']}<br>
+                                🛠️ {op['tool']['toolName']} / Schneide {op['tool']['cuttingEdgeNo']}</small>
+                            </div>
+                            """,
+                            unsafe_allow_html=True
+                        )
+
+                # Alle Zeilen rendern
                 for row_nr in sorted(by_row.keys()):
                     progs = by_row[row_nr]
-                    sp4_k1 = [p for p in progs if p["position"]["channelNumber"] == 1 and p["position"]["spindleNumber"] == 4]
-                    sp4_k2 = [p for p in progs if p["position"]["channelNumber"] == 2 and p["position"]["spindleNumber"] == 4]
-                    sp3_k1 = [p for p in progs if p["position"]["channelNumber"] == 1 and p["position"]["spindleNumber"] == 3]
-                    sp3_k2 = [p for p in progs if p["position"]["channelNumber"] == 2 and p["position"]["spindleNumber"] == 3]
-            
+                    # je Spindel/Kanal filtern
+                    sp4_k1 = [p for p in progs if p["position"]["spindleNumber"] == 4 and p["position"]["channelNumber"] == 1]
+                    sp4_k2 = [p for p in progs if p["position"]["spindleNumber"] == 4 and p["position"]["channelNumber"] == 2]
+                    sp3_k1 = [p for p in progs if p["position"]["spindleNumber"] == 3 and p["position"]["channelNumber"] == 1]
+                    sp3_k2 = [p for p in progs if p["position"]["spindleNumber"] == 3 and p["position"]["channelNumber"] == 2]
+
                     c_sp4_k1, c_sp4_k2, c_sp3_k1, c_sp3_k2 = st.columns(4)
-            
-                    def render_ops(col, ops):
-                        for op in ops:
-                            col.markdown(
-                                f"""
-                                <div style="background-color:#ffffff; border:2px solid #444; 
-                                            padding:10px; border-radius:8px; margin-bottom:10px;
-                                            color:#000;">
-                                    <b>Row {op['position']['rowNumber']}</b> – {op['opName']}<br>
-                                    <small>📄 {op['fileName']}<br>
-                                    🛠️ {op['tool']['toolName']} / Schneide {op['tool']['cuttingEdgeNo']}</small>
-                                </div>
-                                """,
-                                unsafe_allow_html=True
-                            )
-            
                     render_ops(c_sp4_k1, sp4_k1)
                     render_ops(c_sp4_k2, sp4_k2)
                     render_ops(c_sp3_k1, sp3_k1)
@@ -454,7 +474,7 @@ def page_home():
             else:
                 st.info("Keine Programme gefunden.")
 
-
+            # --- Download-Button (kompakte Arrays, z. B. [[1,2,3]]) ---
             st.download_button(
                 "📥 camExportInfo.json herunterladen",
                 data=json.dumps(result, indent=2, ensure_ascii=False, separators=(',', ':')).encode("utf-8"),
@@ -462,8 +482,10 @@ def page_home():
                 mime="application/json",
                 use_container_width=True
             )
+
         except Exception as e:
             st.error(f"Fehler beim Verarbeiten des ZIP: {e}")
+
 
 def page_auswertung():
     st.title("📊 Auswertung")
@@ -704,6 +726,7 @@ def app():
 
 if __name__ == "__main__":
     app()
+
 
 
 
