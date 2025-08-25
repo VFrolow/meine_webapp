@@ -5,13 +5,14 @@ import csv
 import json
 import time
 import zipfile
+import re
 import bcrypt
 import streamlit as st
 from pathlib import Path
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
 
-st.set_page_config(page_title="Login + Admin + ZIP-Scan", layout="wide")
+st.set_page_config(page_title="Login + Admin + ZIP-Scan + Settings", layout="wide")
 
 # =========================================================
 #  DB-Verbindung
@@ -23,9 +24,10 @@ if not DB_URL:
 engine = create_engine(DB_URL, pool_pre_ping=True)
 
 # =========================================================
-#  Schema / Migration (inkl. must_change_password)
+#  Schema / Migration
 # =========================================================
 with engine.begin() as conn:
+    # Users (inkl. must_change_password)
     conn.execute(text("""
         CREATE TABLE IF NOT EXISTS users (
             username   TEXT PRIMARY KEY,
@@ -35,23 +37,13 @@ with engine.begin() as conn:
             created_at TIMESTAMP DEFAULT NOW()
         )
     """))
-    # Nachrüstungen für Bestandsdaten
+    # User-Settings (pro Benutzer gespeichert)
     conn.execute(text("""
-        DO $$
-        BEGIN
-            IF NOT EXISTS (
-                SELECT 1 FROM information_schema.columns
-                WHERE table_name='users' AND column_name='role'
-            ) THEN
-                ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user';
-            END IF;
-            IF NOT EXISTS (
-                SELECT 1 FROM information_schema.columns
-                WHERE table_name='users' AND column_name='must_change_password'
-            ) THEN
-                ALTER TABLE users ADD COLUMN must_change_password BOOLEAN NOT NULL DEFAULT FALSE;
-            END IF;
-        END $$;
+        CREATE TABLE IF NOT EXISTS user_settings (
+            username   TEXT PRIMARY KEY,
+            settings   JSONB NOT NULL,
+            updated_at TIMESTAMP DEFAULT NOW()
+        )
     """))
 
 # =========================================================
@@ -60,6 +52,7 @@ with engine.begin() as conn:
 def _to_bytes(v): return v.tobytes() if hasattr(v, "tobytes") else v
 def hash_password(pw: str) -> bytes: return bcrypt.hashpw(pw.encode("utf-8"), bcrypt.gensalt())
 def check_password(pw: str, pw_hash: bytes) -> bool: return bcrypt.checkpw(pw.encode("utf-8"), pw_hash)
+
 def is_strong(pw: str) -> tuple[bool, str]:
     if len(pw) < 8: return False, "Passwort zu kurz (min. 8 Zeichen)."
     return True, ""
@@ -149,21 +142,222 @@ if SEED_ADMIN_USER and SEED_ADMIN_PASS:
             print(f"Seed-Admin '{SEED_ADMIN_USER}' wurde angelegt.")
 
 # =========================================================
-#  ZIP-Scan (Logik A) – Home
+#  Settings – Defaults, Laden/Speichern (pro Benutzer)
 # =========================================================
-def scan_folder(base_path: Path) -> dict:
-    """Nur .py-Dateien, deren Name 'main' oder 'runner' enthält (case-insensitive)."""
-    result = {"base": str(base_path), "total_files": 0, "matched_files": 0, "by_ext": {}, "files": []}
-    for p in base_path.rglob("*"):
-        if p.is_file():
-            result["total_files"] += 1
-            ext = p.suffix.lower()
-            result["by_ext"][ext] = result["by_ext"].get(ext, 0) + 1
-            name = p.name.lower()
-            if ext == ".py" and ("main" in name or "runner" in name):
-                result["files"].append({"relpath": str(p.relative_to(base_path)), "size_bytes": p.stat().st_size})
-                result["matched_files"] += 1
-    return result
+SETTINGS_KEY = "analyze_settings"
+
+def get_default_settings():
+    return {
+        "npv_hs": "G54",            # NPV Hauptspindel
+        "npv_gs": "G55",            # NPV Gegenspindel
+        "comment_token": ";",       # Kommentar-Kennung: ";" oder "MSG"
+        "search_start_line": 1,     # ab welcher Zeile (1-basiert)
+        "ki_enabled": True,         # KI Analyse aktiv
+        "async_assign": True,       # Asynchrone Zuordnung
+        "search_toolname": True,    # Werkzeugname (T=...)
+        "search_edge": True,        # Schneidennummer (TC(...))
+    }
+
+def load_settings_from_db(username: str):
+    with engine.begin() as conn:
+        row = conn.execute(text("SELECT settings FROM user_settings WHERE username=:u"), {"u": username}).fetchone()
+    return dict(row._mapping)["settings"] if row else None
+
+def save_settings_to_db(username: str, settings: dict):
+    with engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO user_settings (username, settings, updated_at)
+            VALUES (:u, :s, NOW())
+            ON CONFLICT (username) DO UPDATE SET settings = EXCLUDED.settings, updated_at = NOW()
+        """), {"u": username, "s": json.dumps(settings)})
+
+def get_settings():
+    st.session_state.setdefault(SETTINGS_KEY, None)
+    if st.session_state[SETTINGS_KEY] is None:
+        user = st.session_state.get("user")
+        loaded = load_settings_from_db(user) if user else None
+        st.session_state[SETTINGS_KEY] = loaded or get_default_settings()
+    return st.session_state[SETTINGS_KEY]
+
+# =========================================================
+#  Analyzer (deine Logik) – nutzt die Settings
+# =========================================================
+def user_analyzer(root: Path) -> dict:
+    """
+    Übernimmt deine Logik für camExportInfo.json, nutzt Settings aus der Settings-Seite.
+    Erwartet: root = entpackter Projektordner.
+    """
+    s = get_settings()
+    npv_hs = s["npv_hs"].upper().strip()
+    npv_gs = s["npv_gs"].upper().strip()
+    comment_token = s["comment_token"]  # ";" oder "MSG"
+    start_idx = max(1, int(s["search_start_line"])) - 1  # 0-basiert
+    use_ki = bool(s["ki_enabled"])
+    use_async = bool(s["async_assign"])
+    want_tool = bool(s["search_toolname"])
+    want_edge = bool(s["search_edge"])
+
+    project_name = root.name
+    out = {
+        "version": "1.0",
+        "cam": {"name": "VV", "version": "1.0"},
+        "postProcessor": {"name": "pto_opw", "version": "1.0", "producer": "VV"},
+        "project": {
+            "name": project_name,
+            "author": "VV",
+            "workpiece": {"name": "none", "material": "none", "referenceId": "none"},
+        },
+        "machine": {"isMetric": True, "machineType": 2},
+        "programs": [],
+        "rowSyncs": [],
+    }
+
+    # Verbots-/Prüflisten
+    verboten_npv = [";", "E_CON", "TCARR", "MSG", "TCTOOL", "CALL", "HEAD", "PS_", "GROUP_BEGIN", "F_CON"]
+    verboten_end = [";", "MSG"]
+    prg_end_opt  = ["M17", "M30", "RET"]
+
+    rx_prefix_npv = re.compile(r"^\s*(?:" + "|".join(map(re.escape, verboten_npv)) + r")", re.I)
+    rx_prefix_end = re.compile(r"^\s*(?:" + "|".join(map(re.escape, verboten_end)) + r")", re.I)
+    rx_end        = re.compile(r"^\s*(?:" + "|".join(map(re.escape, prg_end_opt)) + r")(?!\d)", re.I)
+
+    # KI-Merkmale
+    merkmale_hs = ["M814", "SETMS(4)", "L707", "SPOS[4]", "C4", "S4", "M4"]
+    merkmale_gs = ["M813", "SETMS(3)", "L705", "SPOS[3]", "C3", "S3", "M3"]
+    rx_ki_hs    = re.compile(r"^\s*(?:" + "|".join(map(re.escape, merkmale_hs)) + r")(?!\d)", re.I)
+    rx_ki_gs    = re.compile(r"^\s*(?:" + "|".join(map(re.escape, merkmale_gs)) + r")(?!\d)", re.I)
+
+    nummer = 101     # Lx101, Lx102, ...
+    row_counter = 0  # wie im Original: Zeilenindizes von 1..N (hier später via (nummer-100))
+
+    while True:
+        dateien_gefunden = 0
+        for chan_no in ("1", "2"):
+            prefix = f"L{chan_no}{nummer}"
+            match_path = None
+            # nur Top-Level
+            for d in os.listdir(root):
+                if d.startswith(prefix):
+                    p = root / d
+                    if p.is_file():
+                        match_path = p
+                        break
+            if not match_path:
+                continue
+
+            dateien_gefunden += 1
+            row_counter += 1
+
+            # Datei lesen
+            try:
+                with open(match_path, "r", encoding="utf-8", errors="ignore") as f:
+                    first = f.readline()
+                    rest  = f.readlines()
+                lines = [first] + rest
+            except Exception:
+                lines = []
+
+            # opName (Kommentar in erster Zeile – ; oder MSG)
+            op_name = "no comment"
+            if lines:
+                if comment_token == ";" and ";" in lines[0]:
+                    op_name = lines[0].split(";", 1)[1].strip()
+                elif comment_token == "MSG":
+                    up0 = lines[0].upper()
+                    if "MSG" in up0:
+                        op_name = lines[0].split("MSG", 1)[1].strip(" :\t\r\n")
+                    elif ";" in lines[0]:
+                        op_name = lines[0].split(";", 1)[1].strip()
+
+            # Werkzeugname (T=...)
+            toolname = ""
+            if want_tool:
+                for raw in lines:
+                    if rx_prefix_npv.search(raw):  # verbotene Präfixe überspringen
+                        continue
+                    m = re.search(r'T\s*=\s*(.*)', raw, re.I)
+                    if m:
+                        toolname = m.group(1).rstrip("\r\n").replace('"', "")
+                        break
+
+            # Schneidennummer (TC(...))
+            cutting_edge = 0
+            if want_edge:
+                for raw in lines:
+                    if rx_prefix_npv.search(raw):
+                        continue
+                    m = re.search(r'TC\s*\(\s*(\d+)', raw, re.I)
+                    if m:
+                        cutting_edge = int(m.group(1))
+                        break
+
+            # Spindelzuordnung: NPV + KI + Ende-Erkennung
+            gxx = 99
+            g54_found = False
+            g55_found = False
+            ki_hs_hit = False
+            ki_gs_hit = False
+
+            seq = lines[max(1, start_idx):]  # ab "Suchen ab"
+
+            for zeile in seq:
+                up = zeile.upper()
+                # Programm-Ende?
+                if rx_end.search(up):
+                    if not rx_prefix_end.search(up):
+                        break
+                # NPV: G54/G55 (konfigurierbar)
+                if re.search(re.escape(npv_hs), up):
+                    if not rx_prefix_npv.search(up):
+                        g54_found = True; gxx = 4; break
+                if re.search(re.escape(npv_gs), up):
+                    if not rx_prefix_npv.search(up):
+                        g55_found = True; gxx = 3; break
+                # KI-Hints
+                if use_ki:
+                    if rx_ki_hs.search(up) and not rx_prefix_end.search(up):
+                        ki_hs_hit = True
+                    if rx_ki_gs.search(up) and not rx_prefix_end.search(up):
+                        ki_gs_hit = True
+
+            # KI-Heuristik falls NPV nicht gefunden
+            if use_ki and not (g54_found or g55_found):
+                if ki_hs_hit and not ki_gs_hit:
+                    gxx = 4
+                elif ki_gs_hit and not ki_hs_hit:
+                    gxx = 3
+
+            # Asynchron/Fallback
+            if gxx == 99 and use_async:
+                gxx = 4 if chan_no == "1" else 3
+            if gxx == 99:
+                gxx = 0
+
+            out["programs"].append({
+                "opName": op_name,
+                "fileName": match_path.name,
+                "id": f"vv_{project_name}_{prefix}",
+                "isTransformationOf": "",
+                "position": {
+                    "channelNumber": int(chan_no),
+                    "spindleNumber": int(gxx),
+                    "rowNumber": (nummer - 100),
+                },
+                "tool": {
+                    "toolName": toolname,
+                    "cuttingEdgeNo": int(cutting_edge),
+                },
+            })
+
+        if dateien_gefunden == 0:
+            break
+        nummer += 1
+
+    # rowSyncs (immer [[1,2,3]] pro Row)
+    for i in range(1, (nummer - 100)):
+        out["rowSyncs"].append({"rowNumber": i, "syncs": [[1, 2, 3]]})
+
+    return out
 
 # =========================================================
 #  Seiten
@@ -172,8 +366,8 @@ def page_home():
     st.title("🏠 Home")
     st.write(f"Eingeloggt als **{st.session_state['user']}**")
     st.markdown("### Programm auswählen (ZIP-Ordner hochladen)")
-    uploaded_zip = st.file_uploader("📦 Ordner als ZIP hochladen", type=["zip"], accept_multiple_files=False)
 
+    uploaded_zip = st.file_uploader("📦 Ordner als ZIP hochladen", type=["zip"], accept_multiple_files=False)
     if uploaded_zip is not None:
         try:
             tmp_dir = Path("/tmp") / f"user_{st.session_state['user']}"
@@ -184,7 +378,8 @@ def page_home():
             tmp_dir.mkdir(parents=True, exist_ok=True)
 
             zip_path = tmp_dir / "uploaded.zip"
-            with open(zip_path, "wb") as f: f.write(uploaded_zip.read())
+            with open(zip_path, "wb") as f:
+                f.write(uploaded_zip.read())
 
             extract_dir = tmp_dir / "extracted"
             if extract_dir.exists():
@@ -193,38 +388,112 @@ def page_home():
                     except IsADirectoryError: pass
             extract_dir.mkdir(parents=True, exist_ok=True)
 
-            with zipfile.ZipFile(zip_path, "r") as z: z.extractall(extract_dir)
-            data = scan_folder(extract_dir)
+            with zipfile.ZipFile(zip_path, "r") as z:
+                z.extractall(extract_dir)
 
-            st.success(f"Scan fertig – Gesamt: {data['total_files']} Dateien | Treffer: {data['matched_files']}")
-            st.write("📂 Basisordner:", data["base"])
-            st.json({"by_ext": data["by_ext"], "preview": data["files"][:10]})
+            with st.spinner("Analysiere Dateien mit deinen Settings…"):
+                result = user_analyzer(extract_dir)
+
+            st.success("camExportInfo.json erzeugt ✅")
+
+            # Vorschau-Tabelle (ohne pandas)
+            rows = []
+            for p in result.get("programs", []):
+                rows.append({
+                    "opName": p.get("opName",""),
+                    "fileName": p.get("fileName",""),
+                    "channel": p.get("position",{}).get("channelNumber",0),
+                    "spindle": p.get("position",{}).get("spindleNumber",0),
+                    "toolName": p.get("tool",{}).get("toolName",""),
+                    "edge": p.get("tool",{}).get("cuttingEdgeNo",0),
+                    "row": p.get("position",{}).get("rowNumber",0),
+                })
+            if rows:
+                st.dataframe(rows, use_container_width=True)
+            else:
+                st.info("Keine Programme gefunden.")
+
             st.download_button(
-                "📥 JSON herunterladen",
-                data=json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8"),
-                file_name="scan_result.json",
+                "📥 camExportInfo.json herunterladen",
+                data=json.dumps(result, indent=2, ensure_ascii=False).encode("utf-8"),
+                file_name="camExportInfo.json",
                 mime="application/json",
                 use_container_width=True
             )
+
         except Exception as e:
             st.error(f"Fehler beim Verarbeiten des ZIP: {e}")
 
 def page_auswertung():
     st.title("📊 Auswertung")
-    st.metric("KPI", "42", "+5")
-    st.progress(0.6)
+    st.info("Hier kannst du später Analysen/Reports auf Basis der camExportInfo einbauen.")
 
 def page_settings():
-    st.title("⚙️ Settings")
-    st.write("Hier kannst du dein Passwort ändern.")
-    change_password_form(show_current=True)
+    st.title("⚙️ Settings (werden pro Benutzer gespeichert)")
+    s = get_settings()
+
+    col1, col2 = st.columns(2)
+    with col1:
+        s["npv_hs"] = st.text_input(
+            "NPV Hauptspindel",
+            value=s["npv_hs"],
+            help="Marker für Hauptspindel (Standard: G54)."
+        )
+        s["npv_gs"] = st.text_input(
+            "NPV Gegenspindel",
+            value=s["npv_gs"],
+            help="Marker für Gegenspindel (Standard: G55)."
+        )
+        s["comment_token"] = st.selectbox(
+            "Kommentar-Kennung",
+            [";", "MSG"],
+            index=(0 if s["comment_token"] == ";" else 1),
+            help="Wie wird der Operationsname in Zeile 1 erkannt? ';' oder 'MSG'."
+        )
+        s["search_start_line"] = st.number_input(
+            "Suchen ab (Zeile, 1-basiert)",
+            min_value=1, value=int(s["search_start_line"]), step=1,
+            help="Ab welcher Zeile der Datei die Analyse beginnt."
+        )
+    with col2:
+        s["ki_enabled"] = st.toggle(
+            "KI Analyse",
+            value=bool(s["ki_enabled"]),
+            help="Heuristiken (z. B. M814→HS / M813→GS), wenn keine NPV (G54/G55) erkannt wird."
+        )
+        s["async_assign"] = st.toggle(
+            "Asynchrone Zuordnung",
+            value=bool(s["async_assign"]),
+            help="Fallback: Wenn keine Marker gefunden werden: K1→SP4, K2→SP3."
+        )
+        s["search_toolname"] = st.toggle(
+            "Werkzeugbezeichnung (T = …)",
+            value=bool(s["search_toolname"]),
+            help="Werkzeugname aus 'T = ...' Zeilen extrahieren."
+        )
+        s["search_edge"] = st.toggle(
+            "Schneidennummer (TC(...))",
+            value=bool(s["search_edge"]),
+            help="Schneidennummer aus 'TC(n)' extrahieren."
+        )
+
+    c1, c2 = st.columns([1,3])
+    with c1:
+        if st.button("💾 Speichern", type="primary"):
+            save_settings_to_db(st.session_state["user"], s)
+            st.success("Settings gespeichert.")
+    with c2:
+        if st.button("↩️ Auf Standard zurücksetzen"):
+            defaults = get_default_settings()
+            st.session_state[SETTINGS_KEY] = defaults
+            save_settings_to_db(st.session_state["user"], defaults)
+            st.info("Auf Standard zurückgesetzt und gespeichert.")
 
 def is_admin_current_user() -> bool:
     u = st.session_state.get("user")
     info = get_user(u) if u else None
     return bool(info and info.get("role") == "admin")
 
-# Passwort ändern
 def change_password_form(show_current: bool = False):
     user = st.session_state.get("user")
     st.subheader("🔒 Passwort ändern")
@@ -250,16 +519,14 @@ def change_password_form(show_current: bool = False):
 
 def page_admin():
     st.title("🛠️ Admin – Benutzerverwaltung")
-
     tabs = st.tabs(["👥 Benutzerliste", "➕ Benutzer anlegen (Temp-PW)"])
 
-    # ===================== TAB 1: BENUTZERLISTE =====================
+    # Liste
     with tabs[0]:
         users = list_users()
         if not users:
             st.info("Keine Benutzer vorhanden.")
         else:
-            # Zeilenanzeige mit Passwort-Setzen (ohne Zwang) und Inline-Löschen (optional)
             for row in users:
                 col1, col2, col3, col4, col5, col6 = st.columns([3,2,3,3,3,2])
                 col1.write(f"**{row['username']}**")
@@ -267,13 +534,11 @@ def page_admin():
                 col3.write("🔁 Wechsel nötig" if row.get('must_change_password') else "✅ gesetzt")
                 col4.write(row.get('created_at'))
 
-                # Passwort setzen (ohne must_change zurückzusetzen)
                 with col5:
-                    with st.popover("Passwort setzen", use_container_width=True):
+                    with st.popover("Passwort setzen (ohne Zwang)", use_container_width=True):
                         new_pw = st.text_input(
                             f"Neues Passwort für {row['username']}",
-                            type="password",
-                            key=f"pw_{row['username']}"
+                            type="password", key=f"pw_{row['username']}"
                         )
                         if st.button("Speichern", key=f"pwbtn_{row['username']}"):
                             if new_pw:
@@ -282,18 +547,15 @@ def page_admin():
                             else:
                                 st.error("Bitte Passwort eingeben.")
 
-                # (Optional) Inline-Löschen – sicherer ist die Danger Zone unten
                 with col6:
                     if st.button("Löschen", key=f"del_inline_{row['username']}"):
                         ok, msg = delete_user(row['username'])
                         if ok:
-                            st.success(msg)
-                            st.rerun()
+                            st.success(msg); st.rerun()
                         else:
                             st.warning(msg)
 
             st.markdown("---")
-            # Rollen ändern
             st.subheader("Rolle ändern")
             sel_user = st.selectbox("Benutzer", [u["username"] for u in users], key="role_sel_user")
             sel_role = st.radio("Rolle", ["user", "admin"], horizontal=True, key="role_sel_role")
@@ -301,18 +563,11 @@ def page_admin():
                 if sel_user == st.session_state.get("user") and sel_role != "admin":
                     st.error("Du kannst dir nicht selbst Admin entziehen.")
                 else:
-                    set_user_role(sel_user, sel_role)
-                    st.success("Rolle aktualisiert.")
-                    st.rerun()
+                    set_user_role(sel_user, sel_role); st.success("Rolle aktualisiert."); st.rerun()
 
             st.markdown("---")
-            # ===================== DANGER ZONE: SICHERES LÖSCHEN =====================
             st.subheader("🗑️ Danger Zone – Benutzer löschen")
-            del_user = st.selectbox(
-                "Benutzer auswählen",
-                [u["username"] for u in users],
-                key="danger_del_user"
-            )
+            del_user = st.selectbox("Benutzer auswählen", [u["username"] for u in users], key="danger_del_user")
             c1, c2 = st.columns([1, 3])
             with c1:
                 confirm = st.checkbox("Ich bestätige das Löschen", key="danger_del_confirm")
@@ -323,19 +578,17 @@ def page_admin():
                     else:
                         ok, msg = delete_user(del_user)
                         if ok:
-                            st.success(msg)
-                            st.rerun()
+                            st.success(msg); st.rerun()
                         else:
                             st.warning(msg)
 
-    # ===================== TAB 2: NEUEN BENUTZER ANLEGEN =====================
+    # Neu anlegen (Temp-PW)
     with tabs[1]:
         st.info("Neuer Nutzer bekommt ein temporäres Passwort und muss es beim ersten Login ändern.")
         nu = st.text_input("Benutzername (neu)", key="admin_new_user")
         npw1 = st.text_input("Temporäres Passwort", type="password", key="admin_new_pw1")
         npw2 = st.text_input("Temporäres Passwort (wiederholen)", type="password", key="admin_new_pw2")
         nrole = st.radio("Rolle", ["user", "admin"], horizontal=True, index=0, key="admin_new_role")
-
         if st.button("Benutzer erstellen", key="admin_create_user_btn"):
             if not nu or not npw1:
                 st.error("Bitte Benutzername & Passwort eingeben.")
@@ -344,8 +597,7 @@ def page_admin():
             else:
                 ok, msg = add_user(nu, npw1, nrole, must_change=True)
                 st.success(msg) if ok else st.error(msg)
-                if ok:
-                    st.rerun()
+                if ok: st.rerun()
 
 # =========================================================
 #  Login / App
@@ -364,6 +616,9 @@ def login_view():
         if h and check_password(p, h):
             st.session_state.update(logged_in=True, user=u, page="Home",
                                     force_pw_change=needs_pw_reset(u))
+            # Settings für Benutzer initial laden
+            st.session_state[SETTINGS_KEY] = None
+            get_settings()
             st.rerun()
         else:
             st.session_state["login_attempts"] += 1
@@ -382,7 +637,7 @@ def app():
     if not st.session_state["logged_in"]:
         login_view(); return
 
-    # Zwang zum Passwortwechsel
+    # Passwortwechsel erzwingen
     if st.session_state.get("force_pw_change", False):
         st.sidebar.info("🔁 Bitte zuerst Passwort ändern (erster Login).")
         change_password_form(show_current=False); return
@@ -408,5 +663,3 @@ def app():
 
 if __name__ == "__main__":
     app()
-
-
