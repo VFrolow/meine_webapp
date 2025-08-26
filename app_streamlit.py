@@ -131,6 +131,21 @@ def delete_user(username: str):
         conn.execute(text("DELETE FROM users WHERE username=:u"), {"u": username})
     return True, "Benutzer gelöscht."
 
+def reassign_spindle(prog_id: str, file_name: str, new_spindle: int):
+    """
+    Setzt die Spindelnummer (0/3/4) eines Programms und schreibt zurück in den Session-State.
+    Muss VOR page_home() definiert sein.
+    """
+    res = st.session_state.get("cam_result")
+    if not res:
+        return
+    for p in res.get("programs", []):
+        if p.get("id") == prog_id and p.get("fileName") == file_name:
+            p["position"]["spindleNumber"] = int(new_spindle)
+            break
+    st.session_state["cam_result"] = res
+
+
 def page_home():
     st.title("🏠 Home")
     st.write(f"Eingeloggt als **{st.session_state['user']}**")
@@ -935,6 +950,7 @@ def app():
 
 if __name__ == "__main__":
     app()
+
 
 
 
