@@ -131,6 +131,190 @@ def delete_user(username: str):
         conn.execute(text("DELETE FROM users WHERE username=:u"), {"u": username})
     return True, "Benutzer gelöscht."
 
+def page_home():
+    st.title("🏠 Home")
+    st.write(f"Eingeloggt als **{st.session_state['user']}**")
+    st.markdown("### Programm auswählen (ZIP-Ordner hochladen)")
+
+    uploaded_zip = st.file_uploader("📦 Ordner als ZIP hochladen", type=["zip"], accept_multiple_files=False)
+    if uploaded_zip is not None:
+        try:
+            # --- ZIP in /tmp/<user>/ entpacken ---
+            tmp_dir = Path("/tmp") / f"user_{st.session_state['user']}"
+            if tmp_dir.exists():
+                for p in tmp_dir.rglob("*"):
+                    try: p.unlink()
+                    except IsADirectoryError: pass
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+
+            zip_path = tmp_dir / "uploaded.zip"
+            with open(zip_path, "wb") as f:
+                f.write(uploaded_zip.read())
+
+            extract_dir = tmp_dir / "extracted"
+            if extract_dir.exists():
+                for p in extract_dir.rglob("*"):
+                    try: p.unlink()
+                    except IsADirectoryError: pass
+            extract_dir.mkdir(parents=True, exist_ok=True)
+
+            import zipfile
+            with zipfile.ZipFile(zip_path, "r") as z:
+                z.extractall(extract_dir)
+
+            # --- Analyzer starten (nutzt Settings) ---
+            with st.spinner("Analysiere Dateien mit deinen Settings…"):
+                result = user_analyzer(extract_dir)
+
+            # In Session speichern (für interaktive Updates)
+            st.session_state["cam_result"] = result
+            st.success("camExportInfo.json erzeugt ✅")
+
+        except Exception as e:
+            st.error(f"Fehler beim Verarbeiten des ZIP: {e}")
+            return
+
+    # ===== Anzeige/Zuordnung, wenn ein Ergebnis vorhanden ist =====
+    result = st.session_state.get("cam_result")
+    if not result:
+        return
+
+    programs = result.get("programs", [])
+    if not programs:
+        st.info("Keine Programme gefunden.")
+        return
+
+    # Programme nach rowNumber gruppieren
+    by_row = {}
+    for p in programs:
+        r = p["position"]["rowNumber"]
+        by_row.setdefault(r, []).append(p)
+
+    # ===== Kopf: zweistufig (Spindeln → Kanäle), Mitte für Unzugeordnet =====
+    c_idx, c_sp4, c_mid, c_sp3 = st.columns([0.3, 2, 1.2, 2])
+    with c_idx:
+        st.markdown("<h3 style='text-align:center;'>#</h3>", unsafe_allow_html=True)
+    with c_sp4:
+        st.markdown("<h3 style='text-align:center;'>🌀 Spindel 4</h3>", unsafe_allow_html=True)
+    with c_mid:
+        st.markdown("<h3 style='text-align:center;'>Unzugeordnet</h3>", unsafe_allow_html=True)
+    with c_sp3:
+        st.markdown("<h3 style='text-align:center;'>🌀 Spindel 3</h3>", unsafe_allow_html=True)
+
+    c_idx, c_sp4_k1, c_sp4_k2, c_mid_lbl, c_sp3_k1, c_sp3_k2 = st.columns([0.3, 1, 1, 1.2, 1, 1])
+    with c_sp4_k1: st.markdown("<h4 style='text-align:center;'>Kanal 1</h4>", unsafe_allow_html=True)
+    with c_sp4_k2: st.markdown("<h4 style='text-align:center;'>Kanal 2</h4>", unsafe_allow_html=True)
+    with c_mid_lbl: st.markdown("<h4 style='text-align:center;'>&nbsp;</h4>", unsafe_allow_html=True)
+    with c_sp3_k1: st.markdown("<h4 style='text-align:center;'>Kanal 1</h4>", unsafe_allow_html=True)
+    with c_sp3_k2: st.markdown("<h4 style='text-align:center;'>Kanal 2</h4>", unsafe_allow_html=True)
+
+    # Karten-Renderer (fixe Höhe + Ellipsis + Tooltip + Buttons)
+    def card_html(op, show_left=False, show_right=False):
+        edge = op['tool']['cuttingEdgeNo']
+        edge_str = f"D{edge}" if edge else ""
+        op_name_full = (op['opName'] or "").strip()
+        tool_line_full = f"{(op['tool']['toolName'] or '').strip()} {edge_str}".strip()
+        pid = op.get("id", "")
+        fname = op.get("fileName", "")
+
+        # Buttons: nur horizontale Bewegung
+        btns = ""
+        if show_left:
+            btns += f"""
+                <form action="#" method="post">
+                    <button type="submit" name="to4_{pid}_{fname}" style="width:100%; padding:6px; margin-top:6px;">
+                        ← nach Spindel 4
+                    </button>
+                </form>
+            """
+        if show_right:
+            btns += f"""
+                <form action="#" method="post">
+                    <button type="submit" name="to3_{pid}_{fname}" style="width:100%; padding:6px; margin-top:6px;">
+                        nach Spindel 3 →
+                    </button>
+                </form>
+            """
+
+        return f"""
+            <div style="background-color:#ffffff; border:2px solid #444;
+                        padding:10px; border-radius:8px; margin-bottom:10px;
+                        min-height:120px; max-height:120px;
+                        color:#000; display:flex; flex-direction:column; justify-content:center;">
+                <div title="{op_name_full}"
+                     style="font-weight:bold; font-size:14px;
+                            white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
+                    {op_name_full}
+                </div>
+                <div title="{tool_line_full}"
+                     style="font-size:12px; color:#333;
+                            white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
+                    🛠️ {tool_line_full}
+                </div>
+                {btns}
+            </div>
+        """.strip()
+
+    # Render-Helfer (Buttons per Streamlit realisieren)
+    def render_list_with_buttons(col, lst, where: str):
+        for op in lst:
+            pid, fname = op.get("id",""), op.get("fileName","")
+            # Button-Sichtbarkeit steuern
+            if where == "mid":
+                left_btn  = col.button("← nach Spindel 4", key=f"to4_{pid}_{fname}")
+                right_btn = col.button("nach Spindel 3 →", key=f"to3_{pid}_{fname}")
+                col.markdown(card_html(op), unsafe_allow_html=True)
+                if left_btn:
+                    reassign_spindle(pid, fname, 4); st.rerun()
+                if right_btn:
+                    reassign_spindle(pid, fname, 3); st.rerun()
+            elif where == "sp4":
+                # Wechsel nach rechts anbieten
+                right_btn = col.button("nach Spindel 3 →", key=f"to3_{pid}_{fname}")
+                col.markdown(card_html(op), unsafe_allow_html=True)
+                if right_btn:
+                    reassign_spindle(pid, fname, 3); st.rerun()
+            elif where == "sp3":
+                # Wechsel nach links anbieten
+                left_btn = col.button("← nach Spindel 4", key=f"to4_{pid}_{fname}")
+                col.markdown(card_html(op), unsafe_allow_html=True)
+                if left_btn:
+                    reassign_spindle(pid, fname, 4); st.rerun()
+
+    # Alle Zeilen rendern
+    for idx, row_nr in enumerate(sorted(by_row.keys()), start=1):
+        progs = by_row[row_nr]
+        sp4_k1 = [p for p in progs if p["position"]["spindleNumber"] == 4 and p["position"]["channelNumber"] == 1]
+        sp4_k2 = [p for p in progs if p["position"]["spindleNumber"] == 4 and p["position"]["channelNumber"] == 2]
+        mid    = [p for p in progs if p["position"]["spindleNumber"] == 0]
+        sp3_k1 = [p for p in progs if p["position"]["spindleNumber"] == 3 and p["position"]["channelNumber"] == 1]
+        sp3_k2 = [p for p in progs if p["position"]["spindleNumber"] == 3 and p["position"]["channelNumber"] == 2]
+
+        c_idx, c_sp4_k1, c_sp4_k2, c_mid, c_sp3_k1, c_sp3_k2 = st.columns([0.3, 1, 1, 1.2, 1, 1])
+        with c_idx:
+            st.markdown(f"<div style='text-align:center; font-weight:bold; margin-top:20px;'>{idx}</div>",
+                        unsafe_allow_html=True)
+
+        # Karten + Buttons
+        render_list_with_buttons(c_sp4_k1, sp4_k1, where="sp4")
+        render_list_with_buttons(c_sp4_k2, sp4_k2, where="sp4")
+        render_list_with_buttons(c_mid,    mid,    where="mid")
+        render_list_with_buttons(c_sp3_k1, sp3_k1, where="sp3")
+        render_list_with_buttons(c_sp3_k2, sp3_k2, where="sp3")
+
+    st.markdown("---")
+
+    # --- Download-Button (kompakte Arrays, z. B. [[1,2,3]]) ---
+    st.download_button(
+        "📥 camExportInfo.json herunterladen",
+        data=json.dumps(result, indent=2, ensure_ascii=False, separators=(',', ':')).encode("utf-8"),
+        file_name="camExportInfo.json",
+        mime="application/json",
+        use_container_width=True
+    )
+
+
+
 # Seed-Admin (idempotent)
 SEED_ADMIN_USER = os.getenv("SEED_ADMIN_USER")
 SEED_ADMIN_PASS = os.getenv("SEED_ADMIN_PASS")
@@ -403,187 +587,149 @@ def page_home():
             st.session_state["cam_result"] = result
             st.success("camExportInfo.json erzeugt ✅")
 
-            # ====== Drag & Drop Board ======
-            result = st.session_state["cam_result"]
-            programs = result.get("programs", [])
-            if not programs:
-                st.info("Keine Programme gefunden.")
-                return
-
-            # Hilfsfunktionen --------------------------------------------
-            def short(txt: str, maxlen: int = 38) -> str:
-                txt = (txt or "").strip()
-                return txt if len(txt) <= maxlen else (txt[:maxlen-1] + "…")
-
-            def pack_item_dict(p: dict) -> dict:
-                """Dict-Item für DnD: id (technisch), content (Anzeige)."""
-                pid = p.get("id", "")
-                fname = p.get("fileName", "")
-                op = short(p.get("opName", ""))
-                tool = short(p.get("tool", {}).get("toolName", ""))
-                edge = p.get("tool", {}).get("cuttingEdgeNo", 0)
-                edge_str = f"D{edge}" if edge else ""
-                label = f"🔧 {op} · {tool} {edge_str}".strip()
-                return {"id": f"{pid}|{fname}", "content": label}
-
-            def parse_id(item_id: str):
-                """id → (pid, fname)"""
-                if "|" in item_id:
-                    pid, fname = item_id.split("|", 1)
-                    return pid, fname
-                return None, None
-
-            def update_spindle_from_items(dict_list: list[dict], spindle: int):
-                """setzt Spindelnummern gemäß aktueller Containerbelegung"""
-                for it in dict_list:
-                    pid, fname = parse_id(it.get("id", ""))
-                    if not pid:
-                        continue
-                    for p in programs:
-                        if p.get("id") == pid and p.get("fileName") == fname:
-                            p["position"]["spindleNumber"] = spindle
-                            break
-
-            # Programme nach rowNumber gruppieren
-            by_row = {}
-            for p in programs:
-                r = p["position"]["rowNumber"]
-                by_row.setdefault(r, []).append(p)
-
-            st.markdown("### Drag & Drop – Arbeitsgänge zuordnen")
-
-            # Kopf: 3 Spalten (Sp4 | Unzugeordnet | Sp3), zweistufig (Spindel-Header + Kanalhinweis)
-            c_sp4, c_mid, c_sp3 = st.columns([2, 1.2, 2])
-            with c_sp4:
-                st.markdown("<h3 style='text-align:center;'>🌀 Spindel 4</h3>", unsafe_allow_html=True)
-                st.markdown("<div style='text-align:center; opacity:.75;'>Kanal 1 &nbsp;|&nbsp; Kanal 2</div>", unsafe_allow_html=True)
-            with c_mid:
-                st.markdown("<h3 style='text-align:center;'>Unzugeordnet</h3>", unsafe_allow_html=True)
-            with c_sp3:
-                st.markdown("<h3 style='text-align:center;'>🌀 Spindel 3</h3>", unsafe_allow_html=True)
-                st.markdown("<div style='text-align:center; opacity:.75;'>Kanal 1 &nbsp;|&nbsp; Kanal 2</div>", unsafe_allow_html=True)
-
-            # pro Row ein DnD-Board mit 3 Containern
-            for row_nr in sorted(by_row.keys()):
-                row_ops = by_row[row_nr]
-                sp4_list = [pack_item_dict(p) for p in row_ops if p["position"]["spindleNumber"] == 4]
-                mid_list = [pack_item_dict(p) for p in row_ops if p["position"]["spindleNumber"] == 0]
-                sp3_list = [pack_item_dict(p) for p in row_ops if p["position"]["spindleNumber"] == 3]
-
-                st.markdown(f"#### Zeile {row_nr}")
-                c1, c2, c3 = st.columns([2, 1.2, 2])
-
-                with c1:
-                    st.caption("Spindel 4")
-                    sp4_list = sortables.sort_items(
-                        sp4_list,
-                        key=f"sp4_{row_nr}",
-                        multi_containers=True,
-                        direction="vertical"
-                    )
-                with c2:
-                    st.caption("Mitte")
-                    mid_list = sortables.sort_items(
-                        mid_list,
-                        key=f"mid_{row_nr}",
-                        multi_containers=True,
-                        direction="vertical"
-                    )
-                with c3:
-                    st.caption("Spindel 3")
-                    sp3_list = sortables.sort_items(
-                        sp3_list,
-                        key=f"sp3_{row_nr}",
-                        multi_containers=True,
-                        direction="vertical"
-                    )
-
-                # Nach Bewegung: Zuordnung im JSON aktualisieren
-                update_spindle_from_items(sp4_list, 4)
-                update_spindle_from_items(sp3_list, 3)
-                update_spindle_from_items(mid_list, 0)
-
-            # ====== Schöne Karten-Übersicht darunter ======
-            st.markdown("---")
-            st.markdown("### Übersicht")
-            # (Neu) gruppiert + sortiert erneut (falls geändert)
-            programs = result.get("programs", [])
-            by_row = {}
-            for p in programs:
-                r = p["position"]["rowNumber"]
-                by_row.setdefault(r, []).append(p)
-
-            # Karten Renderer (fixe Höhe + Ellipsis + Tooltip)
-            def render_card_html(op):
-                edge = op['tool']['cuttingEdgeNo']
-                edge_str = f"D{edge}" if edge else ""
-                op_name_full = (op['opName'] or "").strip()
-                tool_line_full = f"{(op['tool']['toolName'] or '').strip()} {edge_str}".strip()
-                return f"""
-                    <div style="background-color:#ffffff; border:2px solid #444;
-                                padding:10px; border-radius:8px; margin-bottom:10px;
-                                min-height:100px; max-height:100px;
-                                color:#000; display:flex; flex-direction:column; justify-content:center;">
-                        <div title="{op_name_full}"
-                             style="font-weight:bold; font-size:14px;
-                                    white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
-                            {op_name_full}
-                        </div>
-                        <div title="{tool_line_full}"
-                             style="font-size:12px; color:#333;
-                                    white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
-                            🛠️ {tool_line_full}
-                        </div>
-                    </div>
-                """
-
-            # Kopf 2-stufig (Spindel-Header und Kanal-Header je Spindel)
-            c_idx, c_sp4, c_sp3 = st.columns([0.3, 2, 2])
-            with c_idx: st.markdown("<h3 style='text-align:center;'>#</h3>", unsafe_allow_html=True)
-            with c_sp4:
-                st.markdown("<h3 style='text-align:center;'>🌀 Spindel 4</h3>", unsafe_allow_html=True)
-                st.markdown("<div style='text-align:center; opacity:.75;'>Kanal 1 &nbsp;|&nbsp; Kanal 2</div>", unsafe_allow_html=True)
-            with c_sp3:
-                st.markdown("<h3 style='text-align:center;'>🌀 Spindel 3</h3>", unsafe_allow_html=True)
-                st.markdown("<div style='text-align:center; opacity:.75;'>Kanal 1 &nbsp;|&nbsp; Kanal 2</div>", unsafe_allow_html=True)
-
-            c_idx, c_sp4_k1, c_sp4_k2, c_sp3_k1, c_sp3_k2 = st.columns([0.3, 1, 1, 1, 1])
-            with c_sp4_k1: st.markdown("<h4 style='text-align:center;'>Kanal 1</h4>", unsafe_allow_html=True)
-            with c_sp4_k2: st.markdown("<h4 style='text-align:center;'>Kanal 2</h4>", unsafe_allow_html=True)
-            with c_sp3_k1: st.markdown("<h4 style='text-align:center;'>Kanal 1</h4>", unsafe_allow_html=True)
-            with c_sp3_k2: st.markdown("<h4 style='text-align:center;'>Kanal 2</h4>", unsafe_allow_html=True)
-
-            for idx, row_nr in enumerate(sorted(by_row.keys()), start=1):
-                progs = by_row[row_nr]
-                sp4_k1 = [p for p in progs if p["position"]["spindleNumber"] == 4 and p["position"]["channelNumber"] == 1]
-                sp4_k2 = [p for p in progs if p["position"]["spindleNumber"] == 4 and p["position"]["channelNumber"] == 2]
-                sp3_k1 = [p for p in progs if p["position"]["spindleNumber"] == 3 and p["position"]["channelNumber"] == 1]
-                sp3_k2 = [p for p in progs if p["position"]["spindleNumber"] == 3 and p["position"]["channelNumber"] == 2]
-
-                c_idx, c1, c2, c3, c4 = st.columns([0.3, 1, 1, 1, 1])
-                with c_idx:
-                    st.markdown(f"<div style='text-align:center; font-weight:bold; margin-top:20px;'>{idx}</div>", unsafe_allow_html=True)
-
-                def render_list(col, lst):
-                    for op in lst:
-                        col.markdown(render_card_html(op), unsafe_allow_html=True)
-
-                render_list(c1, sp4_k1)
-                render_list(c2, sp4_k2)
-                render_list(c3, sp3_k1)
-                render_list(c4, sp3_k2)
-
-            # --- Download-Button (kompakte Arrays, z. B. [[1,2,3]]) ---
-            st.download_button(
-                "📥 camExportInfo.json herunterladen",
-                data=json.dumps(result, indent=2, ensure_ascii=False, separators=(',', ':')).encode("utf-8"),
-                file_name="camExportInfo.json",
-                mime="application/json",
-                use_container_width=True
-            )
-
         except Exception as e:
             st.error(f"Fehler beim Verarbeiten des ZIP: {e}")
+            return
+
+    # ===== Anzeige/Zuordnung, wenn ein Ergebnis vorhanden ist =====
+    result = st.session_state.get("cam_result")
+    if not result:
+        return
+
+    programs = result.get("programs", [])
+    if not programs:
+        st.info("Keine Programme gefunden.")
+        return
+
+    # Programme nach rowNumber gruppieren
+    by_row = {}
+    for p in programs:
+        r = p["position"]["rowNumber"]
+        by_row.setdefault(r, []).append(p)
+
+    # ===== Kopf: zweistufig (Spindeln → Kanäle), Mitte für Unzugeordnet =====
+    c_idx, c_sp4, c_mid, c_sp3 = st.columns([0.3, 2, 1.2, 2])
+    with c_idx:
+        st.markdown("<h3 style='text-align:center;'>#</h3>", unsafe_allow_html=True)
+    with c_sp4:
+        st.markdown("<h3 style='text-align:center;'>🌀 Spindel 4</h3>", unsafe_allow_html=True)
+    with c_mid:
+        st.markdown("<h3 style='text-align:center;'>Unzugeordnet</h3>", unsafe_allow_html=True)
+    with c_sp3:
+        st.markdown("<h3 style='text-align:center;'>🌀 Spindel 3</h3>", unsafe_allow_html=True)
+
+    c_idx, c_sp4_k1, c_sp4_k2, c_mid_lbl, c_sp3_k1, c_sp3_k2 = st.columns([0.3, 1, 1, 1.2, 1, 1])
+    with c_sp4_k1: st.markdown("<h4 style='text-align:center;'>Kanal 1</h4>", unsafe_allow_html=True)
+    with c_sp4_k2: st.markdown("<h4 style='text-align:center;'>Kanal 2</h4>", unsafe_allow_html=True)
+    with c_mid_lbl: st.markdown("<h4 style='text-align:center;'>&nbsp;</h4>", unsafe_allow_html=True)
+    with c_sp3_k1: st.markdown("<h4 style='text-align:center;'>Kanal 1</h4>", unsafe_allow_html=True)
+    with c_sp3_k2: st.markdown("<h4 style='text-align:center;'>Kanal 2</h4>", unsafe_allow_html=True)
+
+    # Karten-Renderer (fixe Höhe + Ellipsis + Tooltip + Buttons)
+    def card_html(op, show_left=False, show_right=False):
+        edge = op['tool']['cuttingEdgeNo']
+        edge_str = f"D{edge}" if edge else ""
+        op_name_full = (op['opName'] or "").strip()
+        tool_line_full = f"{(op['tool']['toolName'] or '').strip()} {edge_str}".strip()
+        pid = op.get("id", "")
+        fname = op.get("fileName", "")
+
+        # Buttons: nur horizontale Bewegung
+        btns = ""
+        if show_left:
+            btns += f"""
+                <form action="#" method="post">
+                    <button type="submit" name="to4_{pid}_{fname}" style="width:100%; padding:6px; margin-top:6px;">
+                        ← nach Spindel 4
+                    </button>
+                </form>
+            """
+        if show_right:
+            btns += f"""
+                <form action="#" method="post">
+                    <button type="submit" name="to3_{pid}_{fname}" style="width:100%; padding:6px; margin-top:6px;">
+                        nach Spindel 3 →
+                    </button>
+                </form>
+            """
+
+        return f"""
+            <div style="background-color:#ffffff; border:2px solid #444;
+                        padding:10px; border-radius:8px; margin-bottom:10px;
+                        min-height:120px; max-height:120px;
+                        color:#000; display:flex; flex-direction:column; justify-content:center;">
+                <div title="{op_name_full}"
+                     style="font-weight:bold; font-size:14px;
+                            white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
+                    {op_name_full}
+                </div>
+                <div title="{tool_line_full}"
+                     style="font-size:12px; color:#333;
+                            white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
+                    🛠️ {tool_line_full}
+                </div>
+                {btns}
+            </div>
+        """.strip()
+
+    # Render-Helfer (Buttons per Streamlit realisieren)
+    def render_list_with_buttons(col, lst, where: str):
+        for op in lst:
+            pid, fname = op.get("id",""), op.get("fileName","")
+            # Button-Sichtbarkeit steuern
+            if where == "mid":
+                left_btn  = col.button("← nach Spindel 4", key=f"to4_{pid}_{fname}")
+                right_btn = col.button("nach Spindel 3 →", key=f"to3_{pid}_{fname}")
+                col.markdown(card_html(op), unsafe_allow_html=True)
+                if left_btn:
+                    reassign_spindle(pid, fname, 4); st.rerun()
+                if right_btn:
+                    reassign_spindle(pid, fname, 3); st.rerun()
+            elif where == "sp4":
+                # Wechsel nach rechts anbieten
+                right_btn = col.button("nach Spindel 3 →", key=f"to3_{pid}_{fname}")
+                col.markdown(card_html(op), unsafe_allow_html=True)
+                if right_btn:
+                    reassign_spindle(pid, fname, 3); st.rerun()
+            elif where == "sp3":
+                # Wechsel nach links anbieten
+                left_btn = col.button("← nach Spindel 4", key=f"to4_{pid}_{fname}")
+                col.markdown(card_html(op), unsafe_allow_html=True)
+                if left_btn:
+                    reassign_spindle(pid, fname, 4); st.rerun()
+
+    # Alle Zeilen rendern
+    for idx, row_nr in enumerate(sorted(by_row.keys()), start=1):
+        progs = by_row[row_nr]
+        sp4_k1 = [p for p in progs if p["position"]["spindleNumber"] == 4 and p["position"]["channelNumber"] == 1]
+        sp4_k2 = [p for p in progs if p["position"]["spindleNumber"] == 4 and p["position"]["channelNumber"] == 2]
+        mid    = [p for p in progs if p["position"]["spindleNumber"] == 0]
+        sp3_k1 = [p for p in progs if p["position"]["spindleNumber"] == 3 and p["position"]["channelNumber"] == 1]
+        sp3_k2 = [p for p in progs if p["position"]["spindleNumber"] == 3 and p["position"]["channelNumber"] == 2]
+
+        c_idx, c_sp4_k1, c_sp4_k2, c_mid, c_sp3_k1, c_sp3_k2 = st.columns([0.3, 1, 1, 1.2, 1, 1])
+        with c_idx:
+            st.markdown(f"<div style='text-align:center; font-weight:bold; margin-top:20px;'>{idx}</div>",
+                        unsafe_allow_html=True)
+
+        # Karten + Buttons
+        render_list_with_buttons(c_sp4_k1, sp4_k1, where="sp4")
+        render_list_with_buttons(c_sp4_k2, sp4_k2, where="sp4")
+        render_list_with_buttons(c_mid,    mid,    where="mid")
+        render_list_with_buttons(c_sp3_k1, sp3_k1, where="sp3")
+        render_list_with_buttons(c_sp3_k2, sp3_k2, where="sp3")
+
+    st.markdown("---")
+
+    # --- Download-Button (kompakte Arrays, z. B. [[1,2,3]]) ---
+    st.download_button(
+        "📥 camExportInfo.json herunterladen",
+        data=json.dumps(result, indent=2, ensure_ascii=False, separators=(',', ':')).encode("utf-8"),
+        file_name="camExportInfo.json",
+        mime="application/json",
+        use_container_width=True
+    )
+
 
 
 
@@ -826,6 +972,7 @@ def app():
 
 if __name__ == "__main__":
     app()
+
 
 
 
