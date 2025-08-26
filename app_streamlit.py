@@ -11,8 +11,6 @@ import streamlit as st
 from pathlib import Path
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
-import streamlit_sortables as sortables
-
 
 st.set_page_config(page_title="Login + Admin + ZIP-Scan + Settings", layout="wide")
 
@@ -131,6 +129,7 @@ def delete_user(username: str):
         conn.execute(text("DELETE FROM users WHERE username=:u"), {"u": username})
     return True, "Benutzer gelöscht."
 
+# ===== Verschiebe-Helfer (für Home-Ansicht) =====
 def reassign_spindle(prog_id: str, file_name: str, new_spindle: int):
     """
     Setzt die Spindelnummer (0/3/4) eines Programms und schreibt zurück in den Session-State.
@@ -145,7 +144,223 @@ def reassign_spindle(prog_id: str, file_name: str, new_spindle: int):
             break
     st.session_state["cam_result"] = res
 
+# =========================================================
+#  Settings – Defaults, Laden/Speichern (pro Benutzer)
+# =========================================================
+SETTINGS_KEY = "analyze_settings"
 
+def get_default_settings():
+    return {
+        "npv_hs": "G54",            # NPV Hauptspindel
+        "npv_gs": "G55",            # NPV Gegenspindel
+        "comment_token": ";",       # Kommentar-Kennung: ";" oder "MSG"
+        "search_start_line": 1,     # ab welcher Zeile (1-basiert)
+        "ki_enabled": True,         # KI Analyse aktiv
+        "async_assign": True,       # Asynchrone Zuordnung
+        "search_toolname": True,    # Werkzeugname (T=...)
+        "search_edge": True,        # Schneidennummer (TC(...))
+    }
+
+def load_settings_from_db(username: str):
+    with engine.begin() as conn:
+        row = conn.execute(text("SELECT settings FROM user_settings WHERE username=:u"), {"u": username}).fetchone()
+    return dict(row._mapping)["settings"] if row else None
+
+def save_settings_to_db(username: str, settings: dict):
+    with engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO user_settings (username, settings, updated_at)
+            VALUES (:u, :s, NOW())
+            ON CONFLICT (username) DO UPDATE SET settings = EXCLUDED.settings, updated_at = NOW()
+        """), {"u": username, "s": json.dumps(settings)})
+
+def get_settings():
+    st.session_state.setdefault(SETTINGS_KEY, None)
+    if st.session_state[SETTINGS_KEY] is None:
+        user = st.session_state.get("user")
+        loaded = load_settings_from_db(user) if user else None
+        st.session_state[SETTINGS_KEY] = loaded or get_default_settings()
+    return st.session_state[SETTINGS_KEY]
+
+# =========================================================
+#  Analyzer – nutzt Settings
+# =========================================================
+def user_analyzer(root: Path) -> dict:
+    """
+    Analysiert rekursiv alle Dateien, berücksichtigt aber NUR Programme:
+      L1(101..199) / L2(101..199)  -> z.B. L1101, L2101, L1102, L2102, ...
+    Alles andere wird ignoriert.
+    """
+    s = get_settings()
+    npv_hs = s["npv_hs"].upper().strip()
+    npv_gs = s["npv_gs"].upper().strip()
+    comment_token = s["comment_token"]  # ";" oder "MSG"
+    start_idx = max(1, int(s["search_start_line"])) - 1  # 0-basiert
+    use_ki = bool(s["ki_enabled"])
+    use_async = bool(s["async_assign"])
+    want_tool = bool(s["search_toolname"])
+    want_edge = bool(s["search_edge"])
+
+    project_name = root.name
+    out = {
+        "version": "1.0",
+        "cam": {"name": "VV", "version": "1.0"},
+        "postProcessor": {"name": "pto_opw", "version": "1.0", "producer": "VV"},
+        "project": {
+            "name": project_name,
+            "author": "VV",
+            "workpiece": {"name": "none", "material": "none", "referenceId": "none"},
+        },
+        "machine": {"isMetric": True, "machineType": 2},
+        "programs": [],
+        "rowSyncs": [],
+    }
+
+    verboten_npv = [";", "E_CON", "TCARR", "MSG", "TCTOOL", "CALL", "HEAD", "PS_", "GROUP_BEGIN", "F_CON"]
+    verboten_end = [";", "MSG"]
+    prg_end_opt  = ["M17", "M30", "RET"]
+    rx_prefix_npv = re.compile(r"^\s*(?:" + "|".join(map(re.escape, verboten_npv)) + r")", re.I)
+    rx_prefix_end = re.compile(r"^\s*(?:" + "|".join(map(re.escape, verboten_end)) + r")", re.I)
+    rx_end        = re.compile(r"^\s*(?:" + "|".join(map(re.escape, prg_end_opt)) + r")(?!\d)", re.I)
+
+    merkmale_hs = ["M814", "SETMS(4)", "L707", "SPOS[4]", "C4", "S4", "M4"]
+    merkmale_gs = ["M813", "SETMS(3)", "L705", "SPOS[3]", "C3", "S3", "M3"]
+    rx_ki_hs    = re.compile(r"^\s*(?:" + "|".join(map(re.escape, merkmale_hs)) + r")(?!\d)", re.I)
+    rx_ki_gs    = re.compile(r"^\s*(?:" + "|".join(map(re.escape, merkmale_gs)) + r")(?!\d)", re.I)
+
+    # nur L1/L2 + 101..199
+    rx_progname = re.compile(r'^L([12])(1\d{2})(?:\.[A-Za-z0-9]+)?$', re.IGNORECASE)
+
+    jobs: dict[int, dict[str, Path]] = {}
+    for p in root.rglob("*"):
+        if not p.is_file(): continue
+        m = rx_progname.match(p.name)
+        if not m: continue
+        chan = m.group(1)               # "1" oder "2"
+        job_num = int(m.group(2))       # 101..199
+        if not (101 <= job_num <= 199): continue
+        jobs.setdefault(job_num, {})
+        jobs[job_num].setdefault(chan, p)
+
+    if not jobs:
+        return out
+
+    sorted_jobs = sorted(jobs.keys())           # z.B. [101, 102, ...]
+    row_for_job = {num: idx+1 for idx, num in enumerate(sorted_jobs)}
+
+    for job_num in sorted_jobs:
+        row_nr = row_for_job[job_num]
+        for chan_no in ("1", "2"):
+            match_path = jobs[job_num].get(chan_no)
+            if not match_path: continue
+
+            try:
+                with open(match_path, "r", encoding="utf-8", errors="ignore") as f:
+                    first = f.readline()
+                    rest  = f.readlines()
+                lines = [first] + rest
+            except Exception:
+                lines = []
+
+            # opName
+            op_name = "no comment"
+            if lines:
+                if comment_token == ";" and ";" in lines[0]:
+                    op_name = lines[0].split(";", 1)[1].strip()
+                elif comment_token == "MSG":
+                    up0 = lines[0].upper()
+                    if "MSG" in up0:
+                        op_name = lines[0].split("MSG", 1)[1].strip(" :\t\r\n")
+                    elif ";" in lines[0]:
+                        op_name = lines[0].split(";", 1)[1].strip()
+
+            # Werkzeugname
+            toolname = ""
+            if want_tool:
+                for raw in lines:
+                    if rx_prefix_npv.search(raw): continue
+                    m_t = re.search(r'T\s*=\s*(.*)', raw, re.I)
+                    if m_t:
+                        toolname = m_t.group(1).rstrip("\r\n").replace('"', "")
+                        break
+
+            # Schneidennummer
+            cutting_edge = 0
+            if want_edge:
+                for raw in lines:
+                    if rx_prefix_npv.search(raw): continue
+                    m_e = re.search(r'TC\s*\(\s*(\d+)', raw, re.I)
+                    if m_e:
+                        cutting_edge = int(m_e.group(1)); break
+
+            # Spindelzuordnung
+            gxx = 99
+            g54_found = g55_found = False
+            ki_hs_hit = ki_gs_hit = False
+
+            seq = lines[max(1, start_idx):]
+            for zeile in seq:
+                up = zeile.upper()
+                if rx_end.search(up) and not rx_prefix_end.search(up):
+                    break
+                if re.search(re.escape(npv_hs), up) and not rx_prefix_npv.search(up):
+                    g54_found = True; gxx = 4; break
+                if re.search(re.escape(npv_gs), up) and not rx_prefix_npv.search(up):
+                    g55_found = True; gxx = 3; break
+                if use_ki:
+                    if rx_ki_hs.search(up) and not rx_prefix_end.search(up):
+                        ki_hs_hit = True
+                    if rx_ki_gs.search(up) and not rx_prefix_end.search(up):
+                        ki_gs_hit = True
+
+            if use_ki and not (g54_found or g55_found):
+                if   ki_hs_hit and not ki_gs_hit: gxx = 4
+                elif ki_gs_hit and not ki_hs_hit: gxx = 3
+
+            if gxx == 99 and use_async:
+                gxx = 4 if chan_no == "1" else 3
+            if gxx == 99:
+                gxx = 0
+
+            stem_id = f"L{chan_no}{job_num}"  # z.B. L1101/L2101
+            out["programs"].append({
+                "opName": op_name,
+                "fileName": match_path.name,
+                "id": f"vv_{project_name}_{stem_id}",
+                "isTransformationOf": "",
+                "position": {
+                    "channelNumber": int(chan_no),
+                    "spindleNumber": int(gxx),
+                    "rowNumber": row_nr,
+                },
+                "tool": {
+                    "toolName": toolname,
+                    "cuttingEdgeNo": int(cutting_edge),
+                },
+            })
+
+    # rowSyncs – pro erkannter Zeile
+    max_row = len(sorted_jobs)
+    out["rowSyncs"] = [{"rowNumber": i, "syncs": [[1,2,3]]} for i in range(1, max_row + 1)]
+    return out
+
+# =========================================================
+#  Seed-Admin (idempotent)
+# =========================================================
+SEED_ADMIN_USER = os.getenv("SEED_ADMIN_USER")
+SEED_ADMIN_PASS = os.getenv("SEED_ADMIN_PASS")
+if SEED_ADMIN_USER and SEED_ADMIN_PASS:
+    with engine.begin() as conn:
+        exists = conn.execute(text("SELECT 1 FROM users WHERE username=:u"), {"u": SEED_ADMIN_USER}).fetchone()
+        if not exists:
+            conn.execute(text("""INSERT INTO users (username, pwd_hash, role, must_change_password)
+                                 VALUES (:u, :h, 'admin', FALSE)"""),
+                         {"u": SEED_ADMIN_USER, "h": hash_password(SEED_ADMIN_PASS)})
+            print(f"Seed-Admin '{SEED_ADMIN_USER}' wurde angelegt.")
+
+# =========================================================
+#  Seiten
+# =========================================================
 def page_home():
     st.title("🏠 Home")
     st.write(f"Eingeloggt als **{st.session_state['user']}**")
@@ -173,7 +388,6 @@ def page_home():
                     except IsADirectoryError: pass
             extract_dir.mkdir(parents=True, exist_ok=True)
 
-            import zipfile
             with zipfile.ZipFile(zip_path, "r") as z:
                 z.extractall(extract_dir)
 
@@ -197,21 +411,21 @@ def page_home():
         st.info("Keine Programme gefunden.")
         return
 
-    # Styles für Karten
+    # Karten-Styles
     st.markdown("""
     <style>
-      .sm-title{font-weight:600;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
-      .sm-sub{font-size:12px;color:#333;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
-      .fullbtn>div>button{width:100%;padding:6px 8px;}
+      .sm-title{font-weight:600;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin:0;}
+      .sm-sub{font-size:12px;color:#333;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin:2px 0 0 0;}
+      .cardbox{min-height:84px;max-height:84px;display:flex;flex-direction:column;justify-content:center;}
     </style>""", unsafe_allow_html=True)
 
-    # Programme nach rowNumber gruppieren
+    # nach rowNumber gruppieren
     by_row = {}
     for p in programs:
         r = p["position"]["rowNumber"]
         by_row.setdefault(r, []).append(p)
 
-    # Kopfzeile (Spindeln + Mitte)
+    # Kopf (zweistufig): Spindel 4 | Mitte | Spindel 3
     c_idx, c_sp4, c_mid, c_sp3 = st.columns([0.3, 2, 1.2, 2])
     with c_idx:  st.markdown("<h3 style='text-align:center;'>#</h3>", unsafe_allow_html=True)
     with c_sp4:  st.markdown("<h3 style='text-align:center;'>🌀 Spindel 4</h3>", unsafe_allow_html=True)
@@ -225,18 +439,15 @@ def page_home():
     with c_sp3_k1: st.markdown("<h4 style='text-align:center;'>Kanal 1</h4>", unsafe_allow_html=True)
     with c_sp3_k2: st.markdown("<h4 style='text-align:center;'>Kanal 2</h4>", unsafe_allow_html=True)
 
-    # Karten-Renderer
+    # Karte rendern (Buttons im Rahmen, nur horizontal verschieben)
     def render_card(col, op, where: str):
-        """Karte mit fixem Layout & Buttons im Rahmen (nur horizontal verschieben)."""
         edge = op['tool']['cuttingEdgeNo']
         edge_str = f"D{edge}" if edge else ""
         op_name_full   = (op['opName'] or "").strip()
         tool_line_full = f"{(op['tool']['toolName'] or '').strip()} {edge_str}".strip()
         pid, fname = op.get("id",""), op.get("fileName","")
-    
-        # Rahmen als Streamlit-Container => Widgets/Buttons liegen IM Rahmen
+
         with col.container(border=True):
-            # Inhalt (fixe Höhe + Ellipsis via CSS-Klassen)
             st.markdown(
                 f"""
                 <div class="cardbox">
@@ -246,8 +457,7 @@ def page_home():
                 """,
                 unsafe_allow_html=True
             )
-    
-            # Buttons – nur seitliches Verschieben
+
             if where == "mid":
                 cL, cR = st.columns(2)
                 with cL:
@@ -292,426 +502,6 @@ def page_home():
         use_container_width=True
     )
 
-
-
-# Seed-Admin (idempotent)
-SEED_ADMIN_USER = os.getenv("SEED_ADMIN_USER")
-SEED_ADMIN_PASS = os.getenv("SEED_ADMIN_PASS")
-if SEED_ADMIN_USER and SEED_ADMIN_PASS:
-    with engine.begin() as conn:
-        exists = conn.execute(text("SELECT 1 FROM users WHERE username=:u"), {"u": SEED_ADMIN_USER}).fetchone()
-        if not exists:
-            conn.execute(text("""INSERT INTO users (username, pwd_hash, role, must_change_password)
-                                 VALUES (:u, :h, 'admin', FALSE)"""),
-                         {"u": SEED_ADMIN_USER, "h": hash_password(SEED_ADMIN_PASS)})
-            print(f"Seed-Admin '{SEED_ADMIN_USER}' wurde angelegt.")
-
-# =========================================================
-#  Settings – Defaults, Laden/Speichern (pro Benutzer)
-# =========================================================
-SETTINGS_KEY = "analyze_settings"
-
-def get_default_settings():
-    return {
-        "npv_hs": "G54",            # NPV Hauptspindel
-        "npv_gs": "G55",            # NPV Gegenspindel
-        "comment_token": ";",       # Kommentar-Kennung: ";" oder "MSG"
-        "search_start_line": 1,     # ab welcher Zeile (1-basiert)
-        "ki_enabled": True,         # KI Analyse aktiv
-        "async_assign": True,       # Asynchrone Zuordnung
-        "search_toolname": True,    # Werkzeugname (T=...)
-        "search_edge": True,        # Schneidennummer (TC(...))
-    }
-
-def load_settings_from_db(username: str):
-    with engine.begin() as conn:
-        row = conn.execute(text("SELECT settings FROM user_settings WHERE username=:u"), {"u": username}).fetchone()
-    return dict(row._mapping)["settings"] if row else None
-
-def save_settings_to_db(username: str, settings: dict):
-    with engine.begin() as conn:
-        conn.execute(text("""
-            INSERT INTO user_settings (username, settings, updated_at)
-            VALUES (:u, :s, NOW())
-            ON CONFLICT (username) DO UPDATE SET settings = EXCLUDED.settings, updated_at = NOW()
-        """), {"u": username, "s": json.dumps(settings)})
-
-def get_settings():
-    st.session_state.setdefault(SETTINGS_KEY, None)
-    if st.session_state[SETTINGS_KEY] is None:
-        user = st.session_state.get("user")
-        loaded = load_settings_from_db(user) if user else None
-        st.session_state[SETTINGS_KEY] = loaded or get_default_settings()
-    return st.session_state[SETTINGS_KEY]
-
-# =========================================================
-#  Analyzer (deine Logik) – nutzt die Settings
-# =========================================================
-def user_analyzer(root: Path) -> dict:
-    """
-    Analysiert rekursiv alle Dateien, berücksichtigt aber NUR Programme:
-      L1(101..199) / L2(101..199)  -> z.B. L1101, L2101, L1102, L2102, ...
-    Alles andere wird ignoriert.
-    """
-    s = get_settings()
-    npv_hs = s["npv_hs"].upper().strip()
-    npv_gs = s["npv_gs"].upper().strip()
-    comment_token = s["comment_token"]  # ";" oder "MSG"
-    start_idx = max(1, int(s["search_start_line"])) - 1  # 0-basiert
-    use_ki = bool(s["ki_enabled"])
-    use_async = bool(s["async_assign"])
-    want_tool = bool(s["search_toolname"])
-    want_edge = bool(s["search_edge"])
-
-    project_name = root.name
-    out = {
-        "version": "1.0",
-        "cam": {"name": "VV", "version": "1.0"},
-        "postProcessor": {"name": "pto_opw", "version": "1.0", "producer": "VV"},
-        "project": {
-            "name": project_name,
-            "author": "VV",
-            "workpiece": {"name": "none", "material": "none", "referenceId": "none"},
-        },
-        "machine": {"isMetric": True, "machineType": 2},
-        "programs": [],
-        "rowSyncs": [],
-    }
-
-    # Verbots-/Prüflisten & KI wie zuvor
-    verboten_npv = [";", "E_CON", "TCARR", "MSG", "TCTOOL", "CALL", "HEAD", "PS_", "GROUP_BEGIN", "F_CON"]
-    verboten_end = [";", "MSG"]
-    prg_end_opt  = ["M17", "M30", "RET"]
-    rx_prefix_npv = re.compile(r"^\s*(?:" + "|".join(map(re.escape, verboten_npv)) + r")", re.I)
-    rx_prefix_end = re.compile(r"^\s*(?:" + "|".join(map(re.escape, verboten_end)) + r")", re.I)
-    rx_end        = re.compile(r"^\s*(?:" + "|".join(map(re.escape, prg_end_opt)) + r")(?!\d)", re.I)
-
-    merkmale_hs = ["M814", "SETMS(4)", "L707", "SPOS[4]", "C4", "S4", "M4"]
-    merkmale_gs = ["M813", "SETMS(3)", "L705", "SPOS[3]", "C3", "S3", "M3"]
-    rx_ki_hs    = re.compile(r"^\s*(?:" + "|".join(map(re.escape, merkmale_hs)) + r")(?!\d)", re.I)
-    rx_ki_gs    = re.compile(r"^\s*(?:" + "|".join(map(re.escape, merkmale_gs)) + r")(?!\d)", re.I)
-
-    # ---------------- NUR L1/2 + 101..199 zulassen ----------------
-    # Regex erzwingt: L, Kanal 1/2, und genau drei Ziffern beginnend mit 1 (=> 1xx)
-    rx_progname = re.compile(r'^L([12])(1\d{2})(?:\.[A-Za-z0-9]+)?$', re.IGNORECASE)
-
-    # Map: job_num -> { "1": Path, "2": Path }
-    jobs: dict[int, dict[str, Path]] = {}
-    for p in root.rglob("*"):
-        if not p.is_file():
-            continue
-        m = rx_progname.match(p.name)
-        if not m:
-            continue
-        chan = m.group(1)               # "1" oder "2"
-        job_num = int(m.group(2))       # 101..199
-        if not (101 <= job_num <= 199):
-            continue  # hart filtern
-        jobs.setdefault(job_num, {})
-        jobs[job_num].setdefault(chan, p)  # erstes Vorkommen nehmen
-
-    if not jobs:
-        return out
-
-    # Reihen/rowNumber aus den vorhandenen Job-Nummern
-    sorted_jobs = sorted(jobs.keys())  # z.B. [101, 102, ...]
-    row_for_job = {num: idx+1 for idx, num in enumerate(sorted_jobs)}
-
-    # ---------------- Dateien je Job verarbeiten ----------------
-    for job_num in sorted_jobs:
-        row_nr = row_for_job[job_num]
-
-        for chan_no in ("1", "2"):
-            match_path = jobs[job_num].get(chan_no)
-            if not match_path:
-                continue
-
-            # Datei lesen
-            try:
-                with open(match_path, "r", encoding="utf-8", errors="ignore") as f:
-                    first = f.readline()
-                    rest  = f.readlines()
-                lines = [first] + rest
-            except Exception:
-                lines = []
-
-            # opName
-            op_name = "no comment"
-            if lines:
-                if comment_token == ";" and ";" in lines[0]:
-                    op_name = lines[0].split(";", 1)[1].strip()
-                elif comment_token == "MSG":
-                    up0 = lines[0].upper()
-                    if "MSG" in up0:
-                        op_name = lines[0].split("MSG", 1)[1].strip(" :\t\r\n")
-                    elif ";" in lines[0]:
-                        op_name = lines[0].split(";", 1)[1].strip()
-
-            # Werkzeugname
-            toolname = ""
-            if want_tool:
-                for raw in lines:
-                    if rx_prefix_npv.search(raw):
-                        continue
-                    m_t = re.search(r'T\s*=\s*(.*)', raw, re.I)
-                    if m_t:
-                        toolname = m_t.group(1).rstrip("\r\n").replace('"', "")
-                        break
-
-            # Schneidennummer
-            cutting_edge = 0
-            if want_edge:
-                for raw in lines:
-                    if rx_prefix_npv.search(raw):
-                        continue
-                    m_e = re.search(r'TC\s*\(\s*(\d+)', raw, re.I)
-                    if m_e:
-                        cutting_edge = int(m_e.group(1))
-                        break
-
-            # Spindelzuordnung
-            gxx = 99
-            g54_found = False
-            g55_found = False
-            ki_hs_hit = False
-            ki_gs_hit = False
-
-            seq = lines[max(1, start_idx):]
-            for zeile in seq:
-                up = zeile.upper()
-                if rx_end.search(up) and not rx_prefix_end.search(up):
-                    break
-                if re.search(re.escape(npv_hs), up) and not rx_prefix_npv.search(up):
-                    g54_found = True; gxx = 4; break
-                if re.search(re.escape(npv_gs), up) and not rx_prefix_npv.search(up):
-                    g55_found = True; gxx = 3; break
-                if use_ki:
-                    if rx_ki_hs.search(up) and not rx_prefix_end.search(up):
-                        ki_hs_hit = True
-                    if rx_ki_gs.search(up) and not rx_prefix_end.search(up):
-                        ki_gs_hit = True
-
-            if use_ki and not (g54_found or g55_found):
-                if   ki_hs_hit and not ki_gs_hit: gxx = 4
-                elif ki_gs_hit and not ki_hs_hit: gxx = 3
-
-            if gxx == 99 and use_async:
-                gxx = 4 if chan_no == "1" else 3
-            if gxx == 99:
-                gxx = 0
-
-            stem_id = f"L{chan_no}{job_num}"  # z.B. L1101/L2101
-            out["programs"].append({
-                "opName": op_name,
-                "fileName": match_path.name,
-                "id": f"vv_{project_name}_{stem_id}",
-                "isTransformationOf": "",
-                "position": {
-                    "channelNumber": int(chan_no),
-                    "spindleNumber": int(gxx),
-                    "rowNumber": row_nr,
-                },
-                "tool": {
-                    "toolName": toolname,
-                    "cuttingEdgeNo": int(cutting_edge),
-                },
-            })
-
-    # rowSyncs: für jede tatsächliche Zeile ein Eintrag
-    max_row = len(sorted_jobs)
-    out["rowSyncs"] = [{"rowNumber": i, "syncs": [[1,2,3]]} for i in range(1, max_row + 1)]
-    return out
-
-
-
-# =========================================================
-#  Seiten
-# =========================================================
-def page_home():
-    st.title("🏠 Home")
-    st.write(f"Eingeloggt als **{st.session_state['user']}**")
-    st.markdown("### Programm auswählen (ZIP-Ordner hochladen)")
-
-    uploaded_zip = st.file_uploader("📦 Ordner als ZIP hochladen", type=["zip"], accept_multiple_files=False)
-    if uploaded_zip is not None:
-        try:
-            # --- ZIP in /tmp/<user>/ entpacken ---
-            tmp_dir = Path("/tmp") / f"user_{st.session_state['user']}"
-            if tmp_dir.exists():
-                for p in tmp_dir.rglob("*"):
-                    try: p.unlink()
-                    except IsADirectoryError: pass
-            tmp_dir.mkdir(parents=True, exist_ok=True)
-
-            zip_path = tmp_dir / "uploaded.zip"
-            with open(zip_path, "wb") as f:
-                f.write(uploaded_zip.read())
-
-            extract_dir = tmp_dir / "extracted"
-            if extract_dir.exists():
-                for p in extract_dir.rglob("*"):
-                    try: p.unlink()
-                    except IsADirectoryError: pass
-            extract_dir.mkdir(parents=True, exist_ok=True)
-
-            import zipfile
-            with zipfile.ZipFile(zip_path, "r") as z:
-                z.extractall(extract_dir)
-
-            # --- Analyzer starten (nutzt Settings) ---
-            with st.spinner("Analysiere Dateien mit deinen Settings…"):
-                result = user_analyzer(extract_dir)
-
-            # In Session speichern (für interaktive Updates)
-            st.session_state["cam_result"] = result
-            st.success("camExportInfo.json erzeugt ✅")
-
-        except Exception as e:
-            st.error(f"Fehler beim Verarbeiten des ZIP: {e}")
-            return
-
-    # ===== Anzeige/Zuordnung, wenn ein Ergebnis vorhanden ist =====
-    result = st.session_state.get("cam_result")
-    if not result:
-        return
-
-    programs = result.get("programs", [])
-    if not programs:
-        st.info("Keine Programme gefunden.")
-        return
-
-    # Programme nach rowNumber gruppieren
-    by_row = {}
-    for p in programs:
-        r = p["position"]["rowNumber"]
-        by_row.setdefault(r, []).append(p)
-
-    # ===== Kopf: zweistufig (Spindeln → Kanäle), Mitte für Unzugeordnet =====
-    c_idx, c_sp4, c_mid, c_sp3 = st.columns([0.3, 2, 1.2, 2])
-    with c_idx:
-        st.markdown("<h3 style='text-align:center;'>#</h3>", unsafe_allow_html=True)
-    with c_sp4:
-        st.markdown("<h3 style='text-align:center;'>🌀 Spindel 4</h3>", unsafe_allow_html=True)
-    with c_mid:
-        st.markdown("<h3 style='text-align:center;'>Unzugeordnet</h3>", unsafe_allow_html=True)
-    with c_sp3:
-        st.markdown("<h3 style='text-align:center;'>🌀 Spindel 3</h3>", unsafe_allow_html=True)
-
-    c_idx, c_sp4_k1, c_sp4_k2, c_mid_lbl, c_sp3_k1, c_sp3_k2 = st.columns([0.3, 1, 1, 1.2, 1, 1])
-    with c_sp4_k1: st.markdown("<h4 style='text-align:center;'>Kanal 1</h4>", unsafe_allow_html=True)
-    with c_sp4_k2: st.markdown("<h4 style='text-align:center;'>Kanal 2</h4>", unsafe_allow_html=True)
-    with c_mid_lbl: st.markdown("<h4 style='text-align:center;'>&nbsp;</h4>", unsafe_allow_html=True)
-    with c_sp3_k1: st.markdown("<h4 style='text-align:center;'>Kanal 1</h4>", unsafe_allow_html=True)
-    with c_sp3_k2: st.markdown("<h4 style='text-align:center;'>Kanal 2</h4>", unsafe_allow_html=True)
-
-    # Karten-Renderer (fixe Höhe + Ellipsis + Tooltip + Buttons)
-    def card_html(op, show_left=False, show_right=False):
-        edge = op['tool']['cuttingEdgeNo']
-        edge_str = f"D{edge}" if edge else ""
-        op_name_full = (op['opName'] or "").strip()
-        tool_line_full = f"{(op['tool']['toolName'] or '').strip()} {edge_str}".strip()
-        pid = op.get("id", "")
-        fname = op.get("fileName", "")
-
-        # Buttons: nur horizontale Bewegung
-        btns = ""
-        if show_left:
-            btns += f"""
-                <form action="#" method="post">
-                    <button type="submit" name="to4_{pid}_{fname}" style="width:100%; padding:6px; margin-top:6px;">
-                        ← nach Spindel 4
-                    </button>
-                </form>
-            """
-        if show_right:
-            btns += f"""
-                <form action="#" method="post">
-                    <button type="submit" name="to3_{pid}_{fname}" style="width:100%; padding:6px; margin-top:6px;">
-                        nach Spindel 3 →
-                    </button>
-                </form>
-            """
-
-        return f"""
-            <div style="background-color:#ffffff; border:2px solid #444;
-                        padding:10px; border-radius:8px; margin-bottom:10px;
-                        min-height:120px; max-height:120px;
-                        color:#000; display:flex; flex-direction:column; justify-content:center;">
-                <div title="{op_name_full}"
-                     style="font-weight:bold; font-size:14px;
-                            white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
-                    {op_name_full}
-                </div>
-                <div title="{tool_line_full}"
-                     style="font-size:12px; color:#333;
-                            white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
-                    🛠️ {tool_line_full}
-                </div>
-                {btns}
-            </div>
-        """.strip()
-
-    # Render-Helfer (Buttons per Streamlit realisieren)
-    def render_list_with_buttons(col, lst, where: str):
-        for op in lst:
-            pid, fname = op.get("id",""), op.get("fileName","")
-            # Button-Sichtbarkeit steuern
-            if where == "mid":
-                left_btn  = col.button("← nach Spindel 4", key=f"to4_{pid}_{fname}")
-                right_btn = col.button("nach Spindel 3 →", key=f"to3_{pid}_{fname}")
-                col.markdown(card_html(op), unsafe_allow_html=True)
-                if left_btn:
-                    reassign_spindle(pid, fname, 4); st.rerun()
-                if right_btn:
-                    reassign_spindle(pid, fname, 3); st.rerun()
-            elif where == "sp4":
-                # Wechsel nach rechts anbieten
-                right_btn = col.button("nach Spindel 3 →", key=f"to3_{pid}_{fname}")
-                col.markdown(card_html(op), unsafe_allow_html=True)
-                if right_btn:
-                    reassign_spindle(pid, fname, 3); st.rerun()
-            elif where == "sp3":
-                # Wechsel nach links anbieten
-                left_btn = col.button("← nach Spindel 4", key=f"to4_{pid}_{fname}")
-                col.markdown(card_html(op), unsafe_allow_html=True)
-                if left_btn:
-                    reassign_spindle(pid, fname, 4); st.rerun()
-
-    # Alle Zeilen rendern
-    for idx, row_nr in enumerate(sorted(by_row.keys()), start=1):
-        progs = by_row[row_nr]
-        sp4_k1 = [p for p in progs if p["position"]["spindleNumber"] == 4 and p["position"]["channelNumber"] == 1]
-        sp4_k2 = [p for p in progs if p["position"]["spindleNumber"] == 4 and p["position"]["channelNumber"] == 2]
-        mid    = [p for p in progs if p["position"]["spindleNumber"] == 0]
-        sp3_k1 = [p for p in progs if p["position"]["spindleNumber"] == 3 and p["position"]["channelNumber"] == 1]
-        sp3_k2 = [p for p in progs if p["position"]["spindleNumber"] == 3 and p["position"]["channelNumber"] == 2]
-
-        c_idx, c_sp4_k1, c_sp4_k2, c_mid, c_sp3_k1, c_sp3_k2 = st.columns([0.3, 1, 1, 1.2, 1, 1])
-        with c_idx:
-            st.markdown(f"<div style='text-align:center; font-weight:bold; margin-top:20px;'>{idx}</div>",
-                        unsafe_allow_html=True)
-
-        # Karten + Buttons
-        render_list_with_buttons(c_sp4_k1, sp4_k1, where="sp4")
-        render_list_with_buttons(c_sp4_k2, sp4_k2, where="sp4")
-        render_list_with_buttons(c_mid,    mid,    where="mid")
-        render_list_with_buttons(c_sp3_k1, sp3_k1, where="sp3")
-        render_list_with_buttons(c_sp3_k2, sp3_k2, where="sp3")
-
-    st.markdown("---")
-
-    # --- Download-Button (kompakte Arrays, z. B. [[1,2,3]]) ---
-    st.download_button(
-        "📥 camExportInfo.json herunterladen",
-        data=json.dumps(result, indent=2, ensure_ascii=False, separators=(',', ':')).encode("utf-8"),
-        file_name="camExportInfo.json",
-        mime="application/json",
-        use_container_width=True
-    )
-
-
-
-
 def page_auswertung():
     st.title("📊 Auswertung")
     st.info("Hier kannst du später Analysen/Reports auf Basis der camExportInfo einbauen.")
@@ -722,48 +512,23 @@ def page_settings():
 
     col1, col2 = st.columns(2)
     with col1:
-        s["npv_hs"] = st.text_input(
-            "NPV Hauptspindel",
-            value=s["npv_hs"],
-            help="Marker für Hauptspindel (Standard: G54)."
-        )
-        s["npv_gs"] = st.text_input(
-            "NPV Gegenspindel",
-            value=s["npv_gs"],
-            help="Marker für Gegenspindel (Standard: G55)."
-        )
-        s["comment_token"] = st.selectbox(
-            "Kommentar-Kennung",
-            [";", "MSG"],
-            index=(0 if s["comment_token"] == ";" else 1),
-            help="Wie wird der Operationsname in Zeile 1 erkannt? ';' oder 'MSG'."
-        )
-        s["search_start_line"] = st.number_input(
-            "Suchen ab (Zeile, 1-basiert)",
-            min_value=1, value=int(s["search_start_line"]), step=1,
-            help="Ab welcher Zeile der Datei die Analyse beginnt."
-        )
+        s["npv_hs"] = st.text_input("NPV Hauptspindel", value=s["npv_hs"], help="Marker für Hauptspindel (Standard: G54).")
+        s["npv_gs"] = st.text_input("NPV Gegenspindel", value=s["npv_gs"], help="Marker für Gegenspindel (Standard: G55).")
+        s["comment_token"] = st.selectbox("Kommentar-Kennung", [";", "MSG"],
+                                          index=(0 if s["comment_token"] == ";" else 1),
+                                          help="Wie wird der Operationsname in Zeile 1 erkannt? ';' oder 'MSG'.")
+        s["search_start_line"] = st.number_input("Suchen ab (Zeile, 1-basiert)", min_value=1,
+                                                 value=int(s["search_start_line"]), step=1,
+                                                 help="Ab welcher Zeile der Datei die Analyse beginnt.")
     with col2:
-        s["ki_enabled"] = st.toggle(
-            "KI Analyse",
-            value=bool(s["ki_enabled"]),
-            help="Heuristiken (z. B. M814→HS / M813→GS), wenn keine NPV (G54/G55) erkannt wird."
-        )
-        s["async_assign"] = st.toggle(
-            "Asynchrone Zuordnung",
-            value=bool(s["async_assign"]),
-            help="Fallback: Wenn keine Marker gefunden werden: K1→SP4, K2→SP3."
-        )
-        s["search_toolname"] = st.toggle(
-            "Werkzeugbezeichnung (T = …)",
-            value=bool(s["search_toolname"]),
-            help="Werkzeugname aus 'T = ...' Zeilen extrahieren."
-        )
-        s["search_edge"] = st.toggle(
-            "Schneidennummer (TC(...))",
-            value=bool(s["search_edge"]),
-            help="Schneidennummer aus 'TC(n)' extrahieren."
-        )
+        s["ki_enabled"] = st.toggle("KI Analyse", value=bool(s["ki_enabled"]),
+                                    help="Heuristiken (z. B. M814→HS / M813→GS), wenn keine NPV (G54/G55) erkannt wird.")
+        s["async_assign"] = st.toggle("Asynchrone Zuordnung", value=bool(s["async_assign"]),
+                                      help="Fallback: Wenn keine Marker gefunden werden: K1→SP4, K2→SP3.")
+        s["search_toolname"] = st.toggle("Werkzeugbezeichnung (T = …)", value=bool(s["search_toolname"]),
+                                         help="Werkzeugname aus 'T = ...' Zeilen extrahieren.")
+        s["search_edge"] = st.toggle("Schneidennummer (TC(...))", value=bool(s["search_edge"]),
+                                     help="Schneidennummer aus 'TC(n)' extrahieren.")
 
     c1, c2 = st.columns([1,3])
     with c1:
@@ -951,21 +716,3 @@ def app():
 
 if __name__ == "__main__":
     app()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
