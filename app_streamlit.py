@@ -415,8 +415,8 @@ def page_home():
                 txt = (txt or "").strip()
                 return txt if len(txt) <= maxlen else (txt[:maxlen-1] + "…")
 
-            def pack_item(p: dict) -> str:
-                """Serialisiert ein Programm für DnD (anzeige | id/file für Mapping)."""
+            def pack_item_dict(p: dict) -> dict:
+                """Dict-Item für DnD: id (technisch), content (Anzeige)."""
                 pid = p.get("id", "")
                 fname = p.get("fileName", "")
                 op = short(p.get("opName", ""))
@@ -424,25 +424,20 @@ def page_home():
                 edge = p.get("tool", {}).get("cuttingEdgeNo", 0)
                 edge_str = f"D{edge}" if edge else ""
                 label = f"🔧 {op} · {tool} {edge_str}".strip()
-                # codieren (sichtbares Label) + (technische IDs)
-                return f"{label}||{pid}|{fname}"
+                return {"id": f"{pid}|{fname}", "content": label}
 
-            def unpack_item(item: str):
-                """Liest pid/fname aus DnD-Eintrag."""
-                # Format: "<label>||<pid>|<fname>"
-                if "||" not in item: 
-                    return None, None
-                _, right = item.split("||", 1)
-                parts = right.split("|")
-                if len(parts) >= 2:
-                    return parts[0], parts[1]
+            def parse_id(item_id: str):
+                """id → (pid, fname)"""
+                if "|" in item_id:
+                    pid, fname = item_id.split("|", 1)
+                    return pid, fname
                 return None, None
 
-            def update_spindle_from_items(item_list: list[str], spindle: int):
+            def update_spindle_from_items(dict_list: list[dict], spindle: int):
                 """setzt Spindelnummern gemäß aktueller Containerbelegung"""
-                for it in item_list:
-                    pid, fname = unpack_item(it)
-                    if not pid: 
+                for it in dict_list:
+                    pid, fname = parse_id(it.get("id", ""))
+                    if not pid:
                         continue
                     for p in programs:
                         if p.get("id") == pid and p.get("fileName") == fname:
@@ -471,9 +466,9 @@ def page_home():
             # pro Row ein DnD-Board mit 3 Containern
             for row_nr in sorted(by_row.keys()):
                 row_ops = by_row[row_nr]
-                sp4_list = [pack_item(p) for p in row_ops if p["position"]["spindleNumber"] == 4]
-                mid_list = [pack_item(p) for p in row_ops if p["position"]["spindleNumber"] == 0]
-                sp3_list = [pack_item(p) for p in row_ops if p["position"]["spindleNumber"] == 3]
+                sp4_list = [pack_item_dict(p) for p in row_ops if p["position"]["spindleNumber"] == 4]
+                mid_list = [pack_item_dict(p) for p in row_ops if p["position"]["spindleNumber"] == 0]
+                sp3_list = [pack_item_dict(p) for p in row_ops if p["position"]["spindleNumber"] == 3]
 
                 st.markdown(f"#### Zeile {row_nr}")
                 c1, c2, c3 = st.columns([2, 1.2, 2])
@@ -508,10 +503,10 @@ def page_home():
                 update_spindle_from_items(sp3_list, 3)
                 update_spindle_from_items(mid_list, 0)
 
-            # Nach DnD: hübsche Karten-Übersicht (vier Spalten + linke Indexnummer)
+            # ====== Schöne Karten-Übersicht darunter ======
             st.markdown("---")
             st.markdown("### Übersicht")
-            # gruppiert + sortiert erneut (falls geändert)
+            # (Neu) gruppiert + sortiert erneut (falls geändert)
             programs = result.get("programs", [])
             by_row = {}
             for p in programs:
@@ -589,6 +584,7 @@ def page_home():
 
         except Exception as e:
             st.error(f"Fehler beim Verarbeiten des ZIP: {e}")
+
 
 
 def page_auswertung():
@@ -830,6 +826,7 @@ def app():
 
 if __name__ == "__main__":
     app()
+
 
 
 
