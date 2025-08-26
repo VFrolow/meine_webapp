@@ -227,37 +227,37 @@ def page_home():
 
     # Karten-Renderer
     def render_card(col, op, where: str):
-        edge = op['tool']['cuttingEdgeNo']
-        edge_str = f"D{edge}" if edge else ""
-        op_name_full   = (op['opName'] or "").strip()
-        tool_line_full = f"{(op['tool']['toolName'] or '').strip()} {edge_str}".strip()
-        pid, fname = op.get("id",""), op.get("fileName","")
+    edge = op['tool']['cuttingEdgeNo']
+    edge_str = f"D{edge}" if edge else ""
+    op_name_full   = (op['opName'] or "").strip()
+    tool_line_full = f"{(op['tool']['toolName'] or '').strip()} {edge_str}".strip()
+    pid, fname = op.get("id",""), op.get("fileName","")
 
-        box = col.container(border=True)
-        with box:
-            st.markdown(
-                f"""
-                <div style="min-height:84px;max-height:84px;
-                            display:flex;flex-direction:column;justify-content:center;">
-                  <div class="sm-title" title="{op_name_full}">{op_name_full}</div>
-                  <div class="sm-sub" title="{tool_line_full}">🛠️ {tool_line_full}</div>
-                </div>""",
-                unsafe_allow_html=True
-            )
-            if where == "mid":
-                cL, cR = st.columns(2)
-                with cL:
-                    if st.button("← nach Spindel 4", key=f"to4_{pid}_{fname}"):
-                        reassign_spindle(pid, fname, 4); st.rerun()
-                with cR:
-                    if st.button("nach Spindel 3 →", key=f"to3_{pid}_{fname}"):
-                        reassign_spindle(pid, fname, 3); st.rerun()
-            elif where == "sp4":
-                if st.button("nach Spindel 3 →", key=f"to3_{pid}_{fname}"):
-                    reassign_spindle(pid, fname, 3); st.rerun()
-            elif where == "sp3":
+    with col.container(border=True):
+        # Titel + Untertitel (keine offenen divs mehr → kein </div>-Müll)
+        st.markdown(
+            f"""
+            <p class="sm-title" title="{op_name_full}">{op_name_full}</p>
+            <p class="sm-sub"   title="{tool_line_full}">🛠️ {tool_line_full}</p>
+            """,
+            unsafe_allow_html=True
+        )
+
+        # Buttons für Verschieben
+        if where == "mid":
+            cL, cR = st.columns(2)
+            with cL:
                 if st.button("← nach Spindel 4", key=f"to4_{pid}_{fname}"):
                     reassign_spindle(pid, fname, 4); st.rerun()
+            with cR:
+                if st.button("nach Spindel 3 →", key=f"to3_{pid}_{fname}"):
+                    reassign_spindle(pid, fname, 3); st.rerun()
+        elif where == "sp4":
+            if st.button("nach Spindel 3 →", key=f"to3_{pid}_{fname}"):
+                reassign_spindle(pid, fname, 3); st.rerun()
+        elif where == "sp3":
+            if st.button("← nach Spindel 4", key=f"to4_{pid}_{fname}"):
+                reassign_spindle(pid, fname, 4); st.rerun()
 
     # Zeilen darstellen
     for idx, row_nr in enumerate(sorted(by_row.keys()), start=1):
@@ -947,6 +947,7 @@ def app():
 
 if __name__ == "__main__":
     app()
+
 
 
 
