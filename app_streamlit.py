@@ -158,10 +158,8 @@ def page_home():
             tmp_dir = Path("/tmp") / f"user_{st.session_state['user']}"
             if tmp_dir.exists():
                 for p in tmp_dir.rglob("*"):
-                    try:
-                        p.unlink()
-                    except IsADirectoryError:
-                        pass
+                    try: p.unlink()
+                    except IsADirectoryError: pass
             tmp_dir.mkdir(parents=True, exist_ok=True)
 
             zip_path = tmp_dir / "uploaded.zip"
@@ -171,10 +169,8 @@ def page_home():
             extract_dir = tmp_dir / "extracted"
             if extract_dir.exists():
                 for p in extract_dir.rglob("*"):
-                    try:
-                        p.unlink()
-                    except IsADirectoryError:
-                        pass
+                    try: p.unlink()
+                    except IsADirectoryError: pass
             extract_dir.mkdir(parents=True, exist_ok=True)
 
             import zipfile
@@ -189,7 +185,7 @@ def page_home():
 
         except Exception as e:
             st.error(f"Fehler beim Verarbeiten des ZIP: {e}")
-            return  # früh raus
+            return
 
     # ---------- Anzeige / Zuordnung ----------
     result = st.session_state.get("cam_result")
@@ -201,7 +197,7 @@ def page_home():
         st.info("Keine Programme gefunden.")
         return
 
-    # kleine Styles für Karten (einzeilige Ellipsis, kompakte Buttons)
+    # Styles für Karten
     st.markdown("""
     <style>
       .sm-title{font-weight:600;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
@@ -209,13 +205,13 @@ def page_home():
       .fullbtn>div>button{width:100%;padding:6px 8px;}
     </style>""", unsafe_allow_html=True)
 
-    # nach rowNumber gruppieren
+    # Programme nach rowNumber gruppieren
     by_row = {}
     for p in programs:
         r = p["position"]["rowNumber"]
         by_row.setdefault(r, []).append(p)
 
-    # Kopf (zweistufig) – Spindel 4 | Mitte | Spindel 3
+    # Kopfzeile (Spindeln + Mitte)
     c_idx, c_sp4, c_mid, c_sp3 = st.columns([0.3, 2, 1.2, 2])
     with c_idx:  st.markdown("<h3 style='text-align:center;'>#</h3>", unsafe_allow_html=True)
     with c_sp4:  st.markdown("<h3 style='text-align:center;'>🌀 Spindel 4</h3>", unsafe_allow_html=True)
@@ -229,8 +225,8 @@ def page_home():
     with c_sp3_k1: st.markdown("<h4 style='text-align:center;'>Kanal 1</h4>", unsafe_allow_html=True)
     with c_sp3_k2: st.markdown("<h4 style='text-align:center;'>Kanal 2</h4>", unsafe_allow_html=True)
 
+    # Karten-Renderer
     def render_card(col, op, where: str):
-        """Karte mit fixem Layout & Buttons im Rahmen (nur horizontal verschieben)."""
         edge = op['tool']['cuttingEdgeNo']
         edge_str = f"D{edge}" if edge else ""
         op_name_full   = (op['opName'] or "").strip()
@@ -241,7 +237,8 @@ def page_home():
         with box:
             st.markdown(
                 f"""
-                <div style="min-height:84px;max-height:84px;display:flex;flex-direction:column;justify-content:center;">
+                <div style="min-height:84px;max-height:84px;
+                            display:flex;flex-direction:column;justify-content:center;">
                   <div class="sm-title" title="{op_name_full}">{op_name_full}</div>
                   <div class="sm-sub" title="{tool_line_full}">🛠️ {tool_line_full}</div>
                 </div>""",
@@ -262,7 +259,7 @@ def page_home():
                 if st.button("← nach Spindel 4", key=f"to4_{pid}_{fname}"):
                     reassign_spindle(pid, fname, 4); st.rerun()
 
-    # Zeilen rendern
+    # Zeilen darstellen
     for idx, row_nr in enumerate(sorted(by_row.keys()), start=1):
         row = by_row[row_nr]
         sp4_k1 = [p for p in row if p["position"]["spindleNumber"] == 4 and p["position"]["channelNumber"] == 1]
@@ -276,11 +273,11 @@ def page_home():
             st.markdown(f"<div style='text-align:center;font-weight:bold;margin-top:20px;'>{idx}</div>",
                         unsafe_allow_html=True)
 
-        for op in sp4_k1: render_card(c1, op, where="sp4")
-        for op in sp4_k2: render_card(c2, op, where="sp4")
-        for op in mid:    render_card(cM, op, where="mid")
-        for op in sp3_k1: render_card(c3, op, where="sp3")
-        for op in sp3_k2: render_card(c4, op, where="sp3")
+        for op in sp4_k1: render_card(c1, op, "sp4")
+        for op in sp4_k2: render_card(c2, op, "sp4")
+        for op in mid:    render_card(cM, op, "mid")
+        for op in sp3_k1: render_card(c3, op, "sp3")
+        for op in sp3_k2: render_card(c4, op, "sp3")
 
     st.markdown("---")
     st.download_button(
@@ -950,6 +947,7 @@ def app():
 
 if __name__ == "__main__":
     app()
+
 
 
 
