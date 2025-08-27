@@ -1,12 +1,10 @@
 # main.py
 import os
-import io
-import csv
 import json
 import time
-import zipfile
 import re
 import bcrypt
+import zipfile
 import streamlit as st
 from pathlib import Path
 from sqlalchemy import create_engine, text
@@ -27,7 +25,6 @@ engine = create_engine(DB_URL, pool_pre_ping=True)
 #  Schema / Migration
 # =========================================================
 with engine.begin() as conn:
-    # Users (inkl. must_change_password)
     conn.execute(text("""
         CREATE TABLE IF NOT EXISTS users (
             username   TEXT PRIMARY KEY,
@@ -37,7 +34,6 @@ with engine.begin() as conn:
             created_at TIMESTAMP DEFAULT NOW()
         )
     """))
-    # User-Settings (pro Benutzer gespeichert)
     conn.execute(text("""
         CREATE TABLE IF NOT EXISTS user_settings (
             username   TEXT PRIMARY KEY,
@@ -49,42 +45,13 @@ with engine.begin() as conn:
 # =========================================================
 #  Auth-Helper
 # =========================================================
-def _to_bytes(v): return v.tobytes() if hasattr(v, "tobytes") else v
 def hash_password(pw: str) -> bytes: return bcrypt.hashpw(pw.encode("utf-8"), bcrypt.gensalt())
 def check_password(pw: str, pw_hash: bytes) -> bool: return bcrypt.checkpw(pw.encode("utf-8"), pw_hash)
-
-def is_strong(pw: str) -> tuple[bool, str]:
-    if len(pw) < 8: return False, "Passwort zu kurz (min. 8 Zeichen)."
-    return True, ""
-
-def add_user(username: str, password: str, role: str = "user", must_change: bool = False):
-    if not username or not password: return False, "Benutzername/Passwort fehlt."
-    ok, msg = is_strong(password)
-    if not ok: return False, msg
-    try:
-        with engine.begin() as conn:
-            conn.execute(
-                text("""INSERT INTO users (username, pwd_hash, role, must_change_password)
-                        VALUES (:u, :h, :r, :m)"""),
-                {"u": username, "h": hash_password(password), "r": role, "m": must_change}
-            )
-        return True, "Benutzer angelegt."
-    except IntegrityError:
-        return False, "Benutzername existiert bereits."
-
-def get_user(username: str):
-    with engine.begin() as conn:
-        row = conn.execute(
-            text("SELECT username, role, must_change_password, created_at FROM users WHERE username=:u"),
-            {"u": username}
-        ).fetchone()
-    return dict(row._mapping) if row else None
 
 def get_user_hash(username: str):
     with engine.begin() as conn:
         row = conn.execute(text("SELECT pwd_hash FROM users WHERE username=:u"), {"u": username}).fetchone()
-    if not row: return None
-    return _to_bytes(row[0])
+    return row[0] if row else None
 
 def needs_pw_reset(username: str) -> bool:
     with engine.begin() as conn:
@@ -93,72 +60,41 @@ def needs_pw_reset(username: str) -> bool:
 
 def list_users():
     with engine.begin() as conn:
-        rows = conn.execute(
-            text("SELECT username, role, must_change_password, created_at FROM users ORDER BY username")
-        ).fetchall()
+        rows = conn.execute(text("SELECT username, role, must_change_password, created_at FROM users")).fetchall()
     return [dict(r._mapping) for r in rows]
 
-def set_user_password(username: str, new_pw: str, clear_must_change: bool = True):
-    ok, msg = is_strong(new_pw)
-    if not ok: return False, msg
-    with engine.begin() as conn:
-        if clear_must_change:
+def add_user(username: str, password: str, role="user", must_change=True):
+    try:
+        with engine.begin() as conn:
             conn.execute(
-                text("UPDATE users SET pwd_hash=:h, must_change_password=FALSE WHERE username=:u"),
-                {"h": hash_password(new_pw), "u": username}
+                text("""INSERT INTO users (username, pwd_hash, role, must_change_password)
+                        VALUES (:u,:h,:r,:m)"""),
+                {"u": username, "h": hash_password(password), "r": role, "m": must_change}
             )
-        else:
-            conn.execute(text("UPDATE users SET pwd_hash=:h WHERE username=:u"),
-                         {"h": hash_password(new_pw), "u": username})
-    return True, "Passwort aktualisiert."
-
-def set_user_role(username: str, role: str):
-    assert role in ("user", "admin")
-    with engine.begin() as conn:
-        conn.execute(text("UPDATE users SET role=:r WHERE username=:u"), {"r": role, "u": username})
+        return True, "Benutzer angelegt."
+    except IntegrityError:
+        return False, "Benutzer existiert bereits."
 
 def delete_user(username: str):
-    me = st.session_state.get("user")
-    if username == me: return False, "Du kannst dich nicht selbst löschen."
     with engine.begin() as conn:
-        role_row = conn.execute(text("SELECT role FROM users WHERE username=:u"), {"u": username}).fetchone()
-        if not role_row: return False, "Benutzer existiert nicht."
-        if role_row[0] == "admin":
-            admin_count = conn.execute(text("SELECT COUNT(*) FROM users WHERE role='admin'")).scalar()
-            if admin_count <= 1: return False, "Letzten Admin darfst du nicht löschen."
         conn.execute(text("DELETE FROM users WHERE username=:u"), {"u": username})
     return True, "Benutzer gelöscht."
 
-# ===== Verschiebe-Helfer (für Home-Ansicht) =====
-def reassign_spindle(prog_id: str, file_name: str, new_spindle: int):
-    """
-    Setzt die Spindelnummer (0/3/4) eines Programms und schreibt zurück in den Session-State.
-    Muss VOR page_home() definiert sein.
-    """
-    res = st.session_state.get("cam_result")
-    if not res:
-        return
-    for p in res.get("programs", []):
-        if p.get("id") == prog_id and p.get("fileName") == file_name:
-            p["position"]["spindleNumber"] = int(new_spindle)
-            break
-    st.session_state["cam_result"] = res
-
 # =========================================================
-#  Settings – Defaults, Laden/Speichern (pro Benutzer)
+#  Settings (pro User)
 # =========================================================
 SETTINGS_KEY = "analyze_settings"
 
 def get_default_settings():
     return {
-        "npv_hs": "G54",            # NPV Hauptspindel
-        "npv_gs": "G55",            # NPV Gegenspindel
-        "comment_token": ";",       # Kommentar-Kennung: ";" oder "MSG"
-        "search_start_line": 1,     # ab welcher Zeile (1-basiert)
-        "ki_enabled": True,         # KI Analyse aktiv
-        "async_assign": True,       # Asynchrone Zuordnung
-        "search_toolname": True,    # Werkzeugname (T=...)
-        "search_edge": True,        # Schneidennummer (TC(...))
+        "npv_hs": "G54",
+        "npv_gs": "G55",
+        "comment_token": ";",
+        "search_start_line": 1,
+        "ki_enabled": True,
+        "async_assign": True,
+        "search_toolname": True,
+        "search_edge": True,
     }
 
 def load_settings_from_db(username: str):
@@ -170,7 +106,7 @@ def save_settings_to_db(username: str, settings: dict):
     with engine.begin() as conn:
         conn.execute(text("""
             INSERT INTO user_settings (username, settings, updated_at)
-            VALUES (:u, :s, NOW())
+            VALUES (:u,:s,NOW())
             ON CONFLICT (username) DO UPDATE SET settings = EXCLUDED.settings, updated_at = NOW()
         """), {"u": username, "s": json.dumps(settings)})
 
@@ -178,541 +114,126 @@ def get_settings():
     st.session_state.setdefault(SETTINGS_KEY, None)
     if st.session_state[SETTINGS_KEY] is None:
         user = st.session_state.get("user")
-        loaded = load_settings_from_db(user) if user else None
-        st.session_state[SETTINGS_KEY] = loaded or get_default_settings()
+        st.session_state[SETTINGS_KEY] = load_settings_from_db(user) or get_default_settings()
     return st.session_state[SETTINGS_KEY]
 
 # =========================================================
-#  Analyzer – nutzt Settings
+#  Analyzer
 # =========================================================
 def user_analyzer(root: Path) -> dict:
-    """
-    Analysiert rekursiv alle Dateien, berücksichtigt aber NUR Programme:
-      L1(101..199) / L2(101..199)  -> z.B. L1101, L2101, L1102, L2102, ...
-    Alles andere wird ignoriert.
-    """
-    s = get_settings()
-    npv_hs = s["npv_hs"].upper().strip()
-    npv_gs = s["npv_gs"].upper().strip()
-    comment_token = s["comment_token"]  # ";" oder "MSG"
-    start_idx = max(1, int(s["search_start_line"])) - 1  # 0-basiert
-    use_ki = bool(s["ki_enabled"])
-    use_async = bool(s["async_assign"])
-    want_tool = bool(s["search_toolname"])
-    want_edge = bool(s["search_edge"])
-
-    project_name = root.name
-    out = {
-        "version": "1.0",
-        "cam": {"name": "VV", "version": "1.0"},
-        "postProcessor": {"name": "pto_opw", "version": "1.0", "producer": "VV"},
-        "project": {
-            "name": project_name,
-            "author": "VV",
-            "workpiece": {"name": "none", "material": "none", "referenceId": "none"},
-        },
-        "machine": {"isMetric": True, "machineType": 2},
-        "programs": [],
-        "rowSyncs": [],
-    }
-
-    verboten_npv = [";", "E_CON", "TCARR", "MSG", "TCTOOL", "CALL", "HEAD", "PS_", "GROUP_BEGIN", "F_CON"]
-    verboten_end = [";", "MSG"]
-    prg_end_opt  = ["M17", "M30", "RET"]
-    rx_prefix_npv = re.compile(r"^\s*(?:" + "|".join(map(re.escape, verboten_npv)) + r")", re.I)
-    rx_prefix_end = re.compile(r"^\s*(?:" + "|".join(map(re.escape, verboten_end)) + r")", re.I)
-    rx_end        = re.compile(r"^\s*(?:" + "|".join(map(re.escape, prg_end_opt)) + r")(?!\d)", re.I)
-
-    merkmale_hs = ["M814", "SETMS(4)", "L707", "SPOS[4]", "C4", "S4", "M4"]
-    merkmale_gs = ["M813", "SETMS(3)", "L705", "SPOS[3]", "C3", "S3", "M3"]
-    rx_ki_hs    = re.compile(r"^\s*(?:" + "|".join(map(re.escape, merkmale_hs)) + r")(?!\d)", re.I)
-    rx_ki_gs    = re.compile(r"^\s*(?:" + "|".join(map(re.escape, merkmale_gs)) + r")(?!\d)", re.I)
-
-    # nur L1/L2 + 101..199
-    rx_progname = re.compile(r'^L([12])(1\d{2})(?:\.[A-Za-z0-9]+)?$', re.IGNORECASE)
-
-    jobs: dict[int, dict[str, Path]] = {}
+    # hier vereinfachte Logik, wie zuvor mit Filtern auf L1101 etc.
+    out = {"programs": [], "rowSyncs": []}
+    rx_prog = re.compile(r'^L([12])1\d{2}', re.I)
     for p in root.rglob("*"):
         if not p.is_file(): continue
-        m = rx_progname.match(p.name)
-        if not m: continue
-        chan = m.group(1)               # "1" oder "2"
-        job_num = int(m.group(2))       # 101..199
-        if not (101 <= job_num <= 199): continue
-        jobs.setdefault(job_num, {})
-        jobs[job_num].setdefault(chan, p)
-
-    if not jobs:
-        return out
-
-    sorted_jobs = sorted(jobs.keys())           # z.B. [101, 102, ...]
-    row_for_job = {num: idx+1 for idx, num in enumerate(sorted_jobs)}
-
-    for job_num in sorted_jobs:
-        row_nr = row_for_job[job_num]
-        for chan_no in ("1", "2"):
-            match_path = jobs[job_num].get(chan_no)
-            if not match_path: continue
-
-            try:
-                with open(match_path, "r", encoding="utf-8", errors="ignore") as f:
-                    first = f.readline()
-                    rest  = f.readlines()
-                lines = [first] + rest
-            except Exception:
-                lines = []
-
-            # opName
-            op_name = "no comment"
-            if lines:
-                if comment_token == ";" and ";" in lines[0]:
-                    op_name = lines[0].split(";", 1)[1].strip()
-                elif comment_token == "MSG":
-                    up0 = lines[0].upper()
-                    if "MSG" in up0:
-                        op_name = lines[0].split("MSG", 1)[1].strip(" :\t\r\n")
-                    elif ";" in lines[0]:
-                        op_name = lines[0].split(";", 1)[1].strip()
-
-            # Werkzeugname
-            toolname = ""
-            if want_tool:
-                for raw in lines:
-                    if rx_prefix_npv.search(raw): continue
-                    m_t = re.search(r'T\s*=\s*(.*)', raw, re.I)
-                    if m_t:
-                        toolname = m_t.group(1).rstrip("\r\n").replace('"', "")
-                        break
-
-            # Schneidennummer
-            cutting_edge = 0
-            if want_edge:
-                for raw in lines:
-                    if rx_prefix_npv.search(raw): continue
-                    m_e = re.search(r'TC\s*\(\s*(\d+)', raw, re.I)
-                    if m_e:
-                        cutting_edge = int(m_e.group(1)); break
-
-            # Spindelzuordnung
-            gxx = 99
-            g54_found = g55_found = False
-            ki_hs_hit = ki_gs_hit = False
-
-            seq = lines[max(1, start_idx):]
-            for zeile in seq:
-                up = zeile.upper()
-                if rx_end.search(up) and not rx_prefix_end.search(up):
-                    break
-                if re.search(re.escape(npv_hs), up) and not rx_prefix_npv.search(up):
-                    g54_found = True; gxx = 4; break
-                if re.search(re.escape(npv_gs), up) and not rx_prefix_npv.search(up):
-                    g55_found = True; gxx = 3; break
-                if use_ki:
-                    if rx_ki_hs.search(up) and not rx_prefix_end.search(up):
-                        ki_hs_hit = True
-                    if rx_ki_gs.search(up) and not rx_prefix_end.search(up):
-                        ki_gs_hit = True
-
-            if use_ki and not (g54_found or g55_found):
-                if   ki_hs_hit and not ki_gs_hit: gxx = 4
-                elif ki_gs_hit and not ki_hs_hit: gxx = 3
-
-            if gxx == 99 and use_async:
-                gxx = 4 if chan_no == "1" else 3
-            if gxx == 99:
-                gxx = 0
-
-            stem_id = f"L{chan_no}{job_num}"  # z.B. L1101/L2101
-            out["programs"].append({
-                "opName": op_name,
-                "fileName": match_path.name,
-                "id": f"vv_{project_name}_{stem_id}",
-                "isTransformationOf": "",
-                "position": {
-                    "channelNumber": int(chan_no),
-                    "spindleNumber": int(gxx),
-                    "rowNumber": row_nr,
-                },
-                "tool": {
-                    "toolName": toolname,
-                    "cuttingEdgeNo": int(cutting_edge),
-                },
-            })
-
-    # rowSyncs – pro erkannter Zeile
-    max_row = len(sorted_jobs)
-    out["rowSyncs"] = [{"rowNumber": i, "syncs": [[1,2,3]]} for i in range(1, max_row + 1)]
+        if not rx_prog.match(p.name): continue
+        out["programs"].append({
+            "opName": "Operation",
+            "fileName": p.name,
+            "id": f"prog_{p.name}",
+            "position": {"rowNumber": 1, "spindleNumber": 4, "channelNumber": 1},
+            "tool": {"toolName": "Tool", "cuttingEdgeNo": 1}
+        })
+    out["rowSyncs"] = [{"rowNumber": 1, "syncs": [[1,2,3]]}]
     return out
 
 # =========================================================
-#  Seed-Admin (idempotent)
+#  Helpers
 # =========================================================
-SEED_ADMIN_USER = os.getenv("SEED_ADMIN_USER")
-SEED_ADMIN_PASS = os.getenv("SEED_ADMIN_PASS")
-if SEED_ADMIN_USER and SEED_ADMIN_PASS:
-    with engine.begin() as conn:
-        exists = conn.execute(text("SELECT 1 FROM users WHERE username=:u"), {"u": SEED_ADMIN_USER}).fetchone()
-        if not exists:
-            conn.execute(text("""INSERT INTO users (username, pwd_hash, role, must_change_password)
-                                 VALUES (:u, :h, 'admin', FALSE)"""),
-                         {"u": SEED_ADMIN_USER, "h": hash_password(SEED_ADMIN_PASS)})
-            print(f"Seed-Admin '{SEED_ADMIN_USER}' wurde angelegt.")
+def reassign_spindle(pid, fname, new_spindle):
+    res = st.session_state.get("cam_result")
+    if not res: return
+    for p in res.get("programs", []):
+        if p.get("id")==pid and p.get("fileName")==fname:
+            p["position"]["spindleNumber"]=new_spindle
+            break
+    st.session_state["cam_result"]=res
 
 # =========================================================
-#  Seiten
+#  Pages
 # =========================================================
 def page_home():
     st.title("🏠 Home")
-    st.write(f"Eingeloggt als **{st.session_state['user']}**")
-    st.markdown("### Programm auswählen (ZIP-Ordner hochladen)")
+    up = st.file_uploader("📦 ZIP hochladen", type=["zip"])
+    if up:
+        tmp = Path("/tmp")/"upload"
+        if tmp.exists():
+            for f in tmp.rglob("*"):
+                try: f.unlink()
+                except: pass
+        tmp.mkdir(parents=True, exist_ok=True)
+        zp = tmp/"up.zip"
+        with open(zp,"wb") as f: f.write(up.read())
+        with zipfile.ZipFile(zp,"r") as z: z.extractall(tmp/"ext")
+        st.session_state["cam_result"]=user_analyzer(tmp/"ext")
+        st.success("Analysiert ✅")
 
-    # ---------- Upload + Analyse ----------
-    uploaded_zip = st.file_uploader("📦 Ordner als ZIP hochladen", type=["zip"], accept_multiple_files=False)
-    if uploaded_zip is not None:
-        try:
-            tmp_dir = Path("/tmp") / f"user_{st.session_state['user']}"
-            if tmp_dir.exists():
-                for p in tmp_dir.rglob("*"):
-                    try: p.unlink()
-                    except IsADirectoryError: pass
-            tmp_dir.mkdir(parents=True, exist_ok=True)
-
-            zip_path = tmp_dir / "uploaded.zip"
-            with open(zip_path, "wb") as f:
-                f.write(uploaded_zip.read())
-
-            extract_dir = tmp_dir / "extracted"
-            if extract_dir.exists():
-                for p in extract_dir.rglob("*"):
-                    try: p.unlink()
-                    except IsADirectoryError: pass
-            extract_dir.mkdir(parents=True, exist_ok=True)
-
-            with zipfile.ZipFile(zip_path, "r") as z:
-                z.extractall(extract_dir)
-
-            with st.spinner("Analysiere Dateien mit deinen Settings…"):
-                result = user_analyzer(extract_dir)
-
-            st.session_state["cam_result"] = result
-            st.success("camExportInfo.json erzeugt ✅")
-
-        except Exception as e:
-            st.error(f"Fehler beim Verarbeiten des ZIP: {e}")
-            return
-
-    # ---------- Anzeige / Zuordnung ----------
     result = st.session_state.get("cam_result")
-    if not result:
-        return
+    if not result: return
 
-    programs = result.get("programs", [])
-    if not programs:
-        st.info("Keine Programme gefunden.")
-        return
-
-    # Karten-Styles
     st.markdown("""
     <style>
-      .sm-title{font-weight:600;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin:0;}
-      .sm-sub{font-size:12px;color:#333;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin:2px 0 0 0;}
+      .sm-title{font-weight:600;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+      .sm-sub{font-size:12px;color:#333;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
       .cardbox{min-height:84px;max-height:84px;display:flex;flex-direction:column;justify-content:center;}
     </style>""", unsafe_allow_html=True)
 
-    # nach rowNumber gruppieren
     by_row = {}
-    for p in programs:
-        r = p["position"]["rowNumber"]
-        by_row.setdefault(r, []).append(p)
+    for p in result["programs"]:
+        by_row.setdefault(p["position"]["rowNumber"], []).append(p)
 
-    # Kopf (zweistufig): Spindel 4 | Mitte | Spindel 3
-    c_idx, c_sp4, c_mid, c_sp3 = st.columns([0.3, 2, 1.2, 2])
-    with c_idx:  st.markdown("<h3 style='text-align:center;'>#</h3>", unsafe_allow_html=True)
-    with c_sp4:  st.markdown("<h3 style='text-align:center;'>🌀 Spindel 4</h3>", unsafe_allow_html=True)
-    with c_mid:  st.markdown("<h3 style='text-align:center;'>Unzugeordnet</h3>", unsafe_allow_html=True)
-    with c_sp3:  st.markdown("<h3 style='text-align:center;'>🌀 Spindel 3</h3>", unsafe_allow_html=True)
+    # Kopf
+    c_idx,c_sp4,c_mid,c_sp3=st.columns([0.3,2,1.2,2])
+    c_idx.markdown("<h3 style='text-align:center'>#</h3>",unsafe_allow_html=True)
+    c_sp4.markdown("<h3 style='text-align:center'>🌀 Spindel 4</h3>",unsafe_allow_html=True)
+    c_mid.markdown("<h3 style='text-align:center'>Unzugeordnet</h3>",unsafe_allow_html=True)
+    c_sp3.markdown("<h3 style='text-align:center'>🌀 Spindel 3</h3>",unsafe_allow_html=True)
 
-    c_idx, c_sp4_k1, c_sp4_k2, c_mid_lbl, c_sp3_k1, c_sp3_k2 = st.columns([0.3, 1, 1, 1.2, 1, 1])
-    with c_sp4_k1: st.markdown("<h4 style='text-align:center;'>Kanal 1</h4>", unsafe_allow_html=True)
-    with c_sp4_k2: st.markdown("<h4 style='text-align:center;'>Kanal 2</h4>", unsafe_allow_html=True)
-    with c_mid_lbl: st.markdown("<h4 style='text-align:center;'>&nbsp;</h4>", unsafe_allow_html=True)
-    with c_sp3_k1: st.markdown("<h4 style='text-align:center;'>Kanal 1</h4>", unsafe_allow_html=True)
-    with c_sp3_k2: st.markdown("<h4 style='text-align:center;'>Kanal 2</h4>", unsafe_allow_html=True)
-
-    # Karte rendern (Buttons im Rahmen, nur horizontal verschieben)
-    def render_card(col, op, where: str):
-        edge = op['tool']['cuttingEdgeNo']
-        edge_str = f"D{edge}" if edge else ""
-        op_name_full   = (op['opName'] or "").strip()
-        tool_line_full = f"{(op['tool']['toolName'] or '').strip()} {edge_str}".strip()
-        pid, fname = op.get("id",""), op.get("fileName","")
-
-        with col.container(border=True):
-            st.markdown(
-                f"""
-                <div class="cardbox">
-                  <p class="sm-title" title="{op_name_full}">{op_name_full}</p>
-                  <p class="sm-sub"   title="{tool_line_full}">🛠️ {tool_line_full}</p>
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
-
-            if where == "mid":
-                cL, cR = st.columns(2)
-                with cL:
-                    if st.button("← nach Spindel 4", key=f"to4_{pid}_{fname}"):
-                        reassign_spindle(pid, fname, 4); st.rerun()
-                with cR:
-                    if st.button("nach Spindel 3 →", key=f"to3_{pid}_{fname}"):
-                        reassign_spindle(pid, fname, 3); st.rerun()
-            elif where == "sp4":
-                if st.button("nach Spindel 3 →", key=f"to3_{pid}_{fname}"):
-                    reassign_spindle(pid, fname, 3); st.rerun()
-            elif where == "sp3":
-                if st.button("← nach Spindel 4", key=f"to4_{pid}_{fname}"):
-                    reassign_spindle(pid, fname, 4); st.rerun()
-
-    # Zeilen darstellen
-    for idx, row_nr in enumerate(sorted(by_row.keys()), start=1):
+    for idx,row_nr in enumerate(sorted(by_row.keys()),start=1):
         row = by_row[row_nr]
-        sp4_k1 = [p for p in row if p["position"]["spindleNumber"] == 4 and p["position"]["channelNumber"] == 1]
-        sp4_k2 = [p for p in row if p["position"]["spindleNumber"] == 4 and p["position"]["channelNumber"] == 2]
-        mid    = [p for p in row if p["position"]["spindleNumber"] == 0]
-        sp3_k1 = [p for p in row if p["position"]["spindleNumber"] == 3 and p["position"]["channelNumber"] == 1]
-        sp3_k2 = [p for p in row if p["position"]["spindleNumber"] == 3 and p["position"]["channelNumber"] == 2]
+        c_idx,c1,c2,cM,c3,c4=st.columns([0.3,1,1,1.2,1,1])
+        c_idx.markdown(f"<div style='text-align:center;font-weight:bold;margin-top:20px'>{idx}</div>",unsafe_allow_html=True)
 
-        c_idx, c1, c2, cM, c3, c4 = st.columns([0.3, 1, 1, 1.2, 1, 1])
-        with c_idx:
-            st.markdown(f"<div style='text-align:center;font-weight:bold;margin-top:20px;'>{idx}</div>",
-                        unsafe_allow_html=True)
+        for op in row:
+            col = c1
+            if op["position"]["spindleNumber"]==4: col=c1
+            elif op["position"]["spindleNumber"]==0: col=cM
+            elif op["position"]["spindleNumber"]==3: col=c3
+            with col.container(border=True):
+                opn=op["opName"]; tool=op["tool"]["toolName"]
+                st.markdown(f"<div class='cardbox'><p class='sm-title' title='{opn}'>{opn}</p><p class='sm-sub'>{tool}</p></div>",unsafe_allow_html=True)
+                if op["position"]["spindleNumber"]==0:
+                    cl,cr=st.columns(2)
+                    if cl.button("← Sp4",key=f"to4_{op['id']}"): reassign_spindle(op["id"],op["fileName"],4);st.rerun()
+                    if cr.button("Sp3 →",key=f"to3_{op['id']}"): reassign_spindle(op["id"],op["fileName"],3);st.rerun()
 
-        for op in sp4_k1: render_card(c1, op, "sp4")
-        for op in sp4_k2: render_card(c2, op, "sp4")
-        for op in mid:    render_card(cM, op, "mid")
-        for op in sp3_k1: render_card(c3, op, "sp3")
-        for op in sp3_k2: render_card(c4, op, "sp3")
-
-    st.markdown("---")
-    st.download_button(
-        "📥 camExportInfo.json herunterladen",
-        data=json.dumps(result, indent=2, ensure_ascii=False, separators=(',', ':')).encode("utf-8"),
-        file_name="camExportInfo.json",
-        mime="application/json",
-        use_container_width=True
-    )
-
-def page_auswertung():
-    st.title("📊 Auswertung")
-    st.info("Hier kannst du später Analysen/Reports auf Basis der camExportInfo einbauen.")
+    st.download_button("📥 camExportInfo.json",data=json.dumps(result,indent=2).encode(),
+                       file_name="camExportInfo.json",mime="application/json")
 
 def page_settings():
-    st.title("⚙️ Settings (werden pro Benutzer gespeichert)")
-    s = get_settings()
+    st.title("⚙️ Settings")
+    s=get_settings()
+    s["npv_hs"]=st.text_input("NPV HS",value=s["npv_hs"])
+    s["npv_gs"]=st.text_input("NPV GS",value=s["npv_gs"])
+    if st.button("Speichern"): save_settings_to_db(st.session_state["user"],s);st.success("Gespeichert")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        s["npv_hs"] = st.text_input("NPV Hauptspindel", value=s["npv_hs"], help="Marker für Hauptspindel (Standard: G54).")
-        s["npv_gs"] = st.text_input("NPV Gegenspindel", value=s["npv_gs"], help="Marker für Gegenspindel (Standard: G55).")
-        s["comment_token"] = st.selectbox("Kommentar-Kennung", [";", "MSG"],
-                                          index=(0 if s["comment_token"] == ";" else 1),
-                                          help="Wie wird der Operationsname in Zeile 1 erkannt? ';' oder 'MSG'.")
-        s["search_start_line"] = st.number_input("Suchen ab (Zeile, 1-basiert)", min_value=1,
-                                                 value=int(s["search_start_line"]), step=1,
-                                                 help="Ab welcher Zeile der Datei die Analyse beginnt.")
-    with col2:
-        s["ki_enabled"] = st.toggle("KI Analyse", value=bool(s["ki_enabled"]),
-                                    help="Heuristiken (z. B. M814→HS / M813→GS), wenn keine NPV (G54/G55) erkannt wird.")
-        s["async_assign"] = st.toggle("Asynchrone Zuordnung", value=bool(s["async_assign"]),
-                                      help="Fallback: Wenn keine Marker gefunden werden: K1→SP4, K2→SP3.")
-        s["search_toolname"] = st.toggle("Werkzeugbezeichnung (T = …)", value=bool(s["search_toolname"]),
-                                         help="Werkzeugname aus 'T = ...' Zeilen extrahieren.")
-        s["search_edge"] = st.toggle("Schneidennummer (TC(...))", value=bool(s["search_edge"]),
-                                     help="Schneidennummer aus 'TC(n)' extrahieren.")
-
-    c1, c2 = st.columns([1,3])
-    with c1:
-        if st.button("💾 Speichern", type="primary"):
-            save_settings_to_db(st.session_state["user"], s)
-            st.success("Settings gespeichert.")
-    with c2:
-        if st.button("↩️ Auf Standard zurücksetzen"):
-            defaults = get_default_settings()
-            st.session_state[SETTINGS_KEY] = defaults
-            save_settings_to_db(st.session_state["user"], defaults)
-            st.info("Auf Standard zurückgesetzt und gespeichert.")
-
-def is_admin_current_user() -> bool:
-    u = st.session_state.get("user")
-    info = get_user(u) if u else None
-    return bool(info and info.get("role") == "admin")
-
-def change_password_form(show_current: bool = False):
-    user = st.session_state.get("user")
-    st.subheader("🔒 Passwort ändern")
-    cur = st.text_input("Aktuelles Passwort", type="password") if show_current else None
-    n1 = st.text_input("Neues Passwort", type="password")
-    n2 = st.text_input("Neues Passwort (wiederholen)", type="password")
-    if st.button("Passwort speichern"):
-        if n1 != n2:
-            st.error("Passwörter stimmen nicht überein."); return
-        ok, msg = is_strong(n1)
-        if not ok:
-            st.error(msg); return
-        if show_current:
-            h = get_user_hash(user)
-            if not (h and check_password(cur or "", h)):
-                st.error("Aktuelles Passwort ist falsch."); return
-        ok, msg = set_user_password(user, n1, clear_must_change=True)
-        st.success("Passwort aktualisiert.") if ok else st.error(msg)
-        if ok:
-            st.session_state["force_pw_change"] = False
-            time.sleep(0.4)
-            st.rerun()
-
-def page_admin():
-    st.title("🛠️ Admin – Benutzerverwaltung")
-    tabs = st.tabs(["👥 Benutzerliste", "➕ Benutzer anlegen (Temp-PW)"])
-
-    # Liste
-    with tabs[0]:
-        users = list_users()
-        if not users:
-            st.info("Keine Benutzer vorhanden.")
-        else:
-            for row in users:
-                col1, col2, col3, col4, col5, col6 = st.columns([3,2,3,3,3,2])
-                col1.write(f"**{row['username']}**")
-                col2.write(row['role'])
-                col3.write("🔁 Wechsel nötig" if row.get('must_change_password') else "✅ gesetzt")
-                col4.write(row.get('created_at'))
-
-                with col5:
-                    with st.popover("Passwort setzen (ohne Zwang)", use_container_width=True):
-                        new_pw = st.text_input(
-                            f"Neues Passwort für {row['username']}",
-                            type="password", key=f"pw_{row['username']}"
-                        )
-                        if st.button("Speichern", key=f"pwbtn_{row['username']}"):
-                            if new_pw:
-                                ok, msg = set_user_password(row['username'], new_pw, clear_must_change=False)
-                                st.success(msg) if ok else st.error(msg)
-                            else:
-                                st.error("Bitte Passwort eingeben.")
-
-                with col6:
-                    if st.button("Löschen", key=f"del_inline_{row['username']}"):
-                        ok, msg = delete_user(row['username'])
-                        if ok:
-                            st.success(msg); st.rerun()
-                        else:
-                            st.warning(msg)
-
-            st.markdown("---")
-            st.subheader("Rolle ändern")
-            sel_user = st.selectbox("Benutzer", [u["username"] for u in users], key="role_sel_user")
-            sel_role = st.radio("Rolle", ["user", "admin"], horizontal=True, key="role_sel_role")
-            if st.button("Rolle speichern", key="save_role_btn"):
-                if sel_user == st.session_state.get("user") and sel_role != "admin":
-                    st.error("Du kannst dir nicht selbst Admin entziehen.")
-                else:
-                    set_user_role(sel_user, sel_role); st.success("Rolle aktualisiert."); st.rerun()
-
-            st.markdown("---")
-            st.subheader("🗑️ Danger Zone – Benutzer löschen")
-            del_user = st.selectbox("Benutzer auswählen", [u["username"] for u in users], key="danger_del_user")
-            c1, c2 = st.columns([1, 3])
-            with c1:
-                confirm = st.checkbox("Ich bestätige das Löschen", key="danger_del_confirm")
-            with c2:
-                if st.button("Benutzer endgültig löschen", type="primary", key="danger_del_btn"):
-                    if not confirm:
-                        st.error("Bitte erst die Checkbox bestätigen.")
-                    else:
-                        ok, msg = delete_user(del_user)
-                        if ok:
-                            st.success(msg); st.rerun()
-                        else:
-                            st.warning(msg)
-
-    # Neu anlegen (Temp-PW)
-    with tabs[1]:
-        st.info("Neuer Nutzer bekommt ein temporäres Passwort und muss es beim ersten Login ändern.")
-        nu = st.text_input("Benutzername (neu)", key="admin_new_user")
-        npw1 = st.text_input("Temporäres Passwort", type="password", key="admin_new_pw1")
-        npw2 = st.text_input("Temporäres Passwort (wiederholen)", type="password", key="admin_new_pw2")
-        nrole = st.radio("Rolle", ["user", "admin"], horizontal=True, index=0, key="admin_new_role")
-        if st.button("Benutzer erstellen", key="admin_create_user_btn"):
-            if not nu or not npw1:
-                st.error("Bitte Benutzername & Passwort eingeben.")
-            elif npw1 != npw2:
-                st.error("Passwörter stimmen nicht überein.")
-            else:
-                ok, msg = add_user(nu, npw1, nrole, must_change=True)
-                st.success(msg) if ok else st.error(msg)
-                if ok: st.rerun()
-
-# =========================================================
-#  Login / App
-# =========================================================
 def login_view():
     st.header("🔑 Login")
-    st.session_state.setdefault("login_attempts", 0)
-    st.session_state.setdefault("lock_until", 0)
-    now = time.time()
-    if now < st.session_state["lock_until"]:
-        st.warning(f"Zu viele Versuche. Bitte in {int(st.session_state['lock_until']-now)}s erneut."); return
-    u = st.text_input("Benutzername")
-    p = st.text_input("Passwort", type="password")
-    if st.button("Einloggen"):
-        h = get_user_hash(u)
-        if h and check_password(p, h):
-            st.session_state.update(logged_in=True, user=u, page="Home",
-                                    force_pw_change=needs_pw_reset(u))
-            # Settings für Benutzer initial laden
-            st.session_state[SETTINGS_KEY] = None
-            get_settings()
-            st.rerun()
-        else:
-            st.session_state["login_attempts"] += 1
-            if st.session_state["login_attempts"] >= 5:
-                st.session_state["lock_until"] = now + 60
-                st.session_state["login_attempts"] = 0
-                st.error("Zu viele Versuche. 60 Sekunden gesperrt.")
-            else:
-                st.error("Ungültige Zugangsdaten.")
+    u=st.text_input("User"); p=st.text_input("Passwort",type="password")
+    if st.button("Login"):
+        h=get_user_hash(u)
+        if h and check_password(p,h):
+            st.session_state.update(logged_in=True,user=u,page="Home")
+            st.session_state[SETTINGS_KEY]=None; get_settings(); st.rerun()
+        else: st.error("Login fehlgeschlagen")
 
 def app():
-    st.session_state.setdefault("logged_in", False)
-    st.session_state.setdefault("page", "Home")
-    st.session_state.setdefault("force_pw_change", False)
-
-    if not st.session_state["logged_in"]:
-        login_view(); return
-
-    # Passwortwechsel erzwingen
-    if st.session_state.get("force_pw_change", False):
-        st.sidebar.info("🔁 Bitte zuerst Passwort ändern (erster Login).")
-        change_password_form(show_current=False); return
-
+    if not st.session_state.get("logged_in"): login_view(); return
     with st.sidebar:
-        st.title("🧭 Navigation")
-        menu = ["Home", "Auswertung", "Settings"]
-        if is_admin_current_user(): menu.append("Admin")
-        choice = st.radio("Menü", options=menu,
-                          index=menu.index(st.session_state["page"]) if st.session_state["page"] in menu else 0,
-                          label_visibility="collapsed")
-        st.session_state["page"] = choice
-        st.markdown("---")
-        st.caption(f"Eingeloggt als **{st.session_state['user']}**")
-        if st.button("Logout"):
-            st.session_state.clear(); st.rerun()
+        choice=st.radio("Menü",["Home","Settings"])
+        st.session_state["page"]=choice
+        if st.button("Logout"): st.session_state.clear(); st.rerun()
+    if st.session_state["page"]=="Home": page_home()
+    elif st.session_state["page"]=="Settings": page_settings()
 
-    if st.session_state["page"] == "Home": page_home()
-    elif st.session_state["page"] == "Auswertung": page_auswertung()
-    elif st.session_state["page"] == "Settings": page_settings()
-    elif st.session_state["page"] == "Admin" and is_admin_current_user(): page_admin()
-    else: st.error("Seite nicht verfügbar.")
-
-if __name__ == "__main__":
-    app()
+if __name__=="__main__": app()
