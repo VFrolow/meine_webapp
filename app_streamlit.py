@@ -11,7 +11,7 @@ from pathlib import Path
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
 
-st.set_page_config(page_title="Login + Admin + ZIP-Scan + Settings", layout="wide")
+st.set_page_config(page_title="Login + Settings + ZIP-Scan", layout="wide")
 
 # =========================================================
 #  DB-Verbindung
@@ -53,32 +53,21 @@ def check_password(pw: str, pw_hash: bytes) -> bool:
     return bcrypt.checkpw(pw.encode("utf-8"), pw_hash)
 
 def _to_bytes(h) -> bytes:
-    # memoryview/bytearray/bytes → bytes
-    if isinstance(h, bytes):
-        return h
-    if isinstance(h, bytearray):
-        return bytes(h)
-    try:
-        return bytes(h)
-    except Exception:
-        return h  # letzte Chance
+    if isinstance(h, bytes): return h
+    if isinstance(h, bytearray): return bytes(h)
+    try: return bytes(h)
+    except Exception: return h
 
 def get_user_hash(username: str):
     with engine.begin() as conn:
         row = conn.execute(text("SELECT pwd_hash FROM users WHERE username=:u"), {"u": username}).fetchone()
-    if not row:
-        return None
+    if not row: return None
     return _to_bytes(row[0])
 
 def needs_pw_reset(username: str) -> bool:
     with engine.begin() as conn:
         v = conn.execute(text("SELECT must_change_password FROM users WHERE username=:u"), {"u": username}).scalar()
     return bool(v)
-
-def list_users():
-    with engine.begin() as conn:
-        rows = conn.execute(text("SELECT username, role, must_change_password, created_at FROM users ORDER BY username")).fetchall()
-    return [dict(r._mapping) for r in rows]
 
 def add_user(username: str, password: str, role="user", must_change=True):
     try:
@@ -92,12 +81,7 @@ def add_user(username: str, password: str, role="user", must_change=True):
     except IntegrityError:
         return False, "Benutzer existiert bereits."
 
-def delete_user(username: str):
-    with engine.begin() as conn:
-        conn.execute(text("DELETE FROM users WHERE username=:u"), {"u": username})
-    return True, "Benutzer gelöscht."
-
-# Optionaler Seed-Admin für den Erstzugang (Env in Render setzen)
+# Optionaler Seed-Admin (Env in Render setzen)
 SEED_ADMIN_USER = os.getenv("SEED_ADMIN_USER")
 SEED_ADMIN_PASS = os.getenv("SEED_ADMIN_PASS")
 if SEED_ADMIN_USER and SEED_ADMIN_PASS:
@@ -148,27 +132,23 @@ def get_settings():
     return st.session_state[SETTINGS_KEY]
 
 # =========================================================
-#  Analyzer (vereinfacht, mit Filter auf L1(101..199)/L2(101..199))
+#  Analyzer – nur L1(101..199)/L2(101..199), rowSyncs=[[1,2,3]]
 # =========================================================
 def user_analyzer(root: Path) -> dict:
     """
     Berücksichtigt NUR Programme L1(101..199) / L2(101..199), z. B. L1101, L2101, ...
     """
     out = {"programs": [], "rowSyncs": []}
-    # L + Kanal (1|2) + dreistellig ab 1xx (101..199)
     rx_progname = re.compile(r'^L([12])(1\d{2})(?:\.[A-Za-z0-9]+)?$', re.IGNORECASE)
 
     jobs: dict[int, dict[str, Path]] = {}
     for p in root.rglob("*"):
-        if not p.is_file():
-            continue
+        if not p.is_file(): continue
         m = rx_progname.match(p.name)
-        if not m:
-            continue
+        if not m: continue
         chan = m.group(1)               # "1" oder "2"
         job_num = int(m.group(2))       # 101..199
-        if not (101 <= job_num <= 199):
-            continue
+        if not (101 <= job_num <= 199): continue
         jobs.setdefault(job_num, {})
         jobs[job_num].setdefault(chan, p)
 
@@ -178,13 +158,11 @@ def user_analyzer(root: Path) -> dict:
     sorted_jobs = sorted(jobs.keys())
     row_for_job = {num: i+1 for i, num in enumerate(sorted_jobs)}
 
-    # Dummy-Werte für Anzeige (kannst du mit echter Logik ersetzen)
     for job_num in sorted_jobs:
         row_nr = row_for_job[job_num]
         for chan in ("1", "2"):
             fp = jobs[job_num].get(chan)
-            if not fp:
-                continue
+            if not fp: continue
             out["programs"].append({
                 "opName": f"Operation {fp.stem}",
                 "fileName": fp.name,
@@ -205,8 +183,7 @@ def user_analyzer(root: Path) -> dict:
 # =========================================================
 def reassign_spindle(pid, fname, new_spindle):
     res = st.session_state.get("cam_result")
-    if not res:
-        return
+    if not res: return
     for p in res.get("programs", []):
         if p.get("id") == pid and p.get("fileName") == fname:
             p["position"]["spindleNumber"] = int(new_spindle)
@@ -250,7 +227,7 @@ def page_home():
         st.info("Keine Programme gefunden.")
         return
 
-    # Karten-Styles
+    # Karten-Styles (inkl. Tooltip per title-Attribut)
     st.markdown("""
     <style>
       .sm-title{font-weight:600;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin:0;}
@@ -342,7 +319,6 @@ def login_view():
         if h and check_password(p, h):
             st.session_state.update(logged_in=True, user=u, page="Home",
                                     force_pw_change=needs_pw_reset(u))
-            # Settings initial laden
             st.session_state[SETTINGS_KEY] = None
             get_settings()
             st.rerun()
@@ -357,17 +333,13 @@ def app():
         login_view()
         return
 
-    if st.session_state.get("force_pw_change", False):
-        st.warning("Beim ersten Login bitte Passwort ändern (Feature kann später ergänzt werden).")
-
     with st.sidebar:
         choice = st.radio("Menü", ["Home", "Settings"])
         st.session_state["page"] = choice
         st.markdown("---")
         st.caption(f"Eingeloggt als **{st.session_state.get('user','?')}**")
         if st.button("Logout"):
-            st.session_state.clear()
-            st.rerun()
+            st.session_state.clear(); st.rerun()
 
     if st.session_state["page"] == "Home":
         page_home()
