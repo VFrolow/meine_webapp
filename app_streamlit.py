@@ -2,6 +2,7 @@
 import os
 import json
 import re
+import time
 import shutil
 import zipfile
 import bcrypt
@@ -10,10 +11,10 @@ from pathlib import Path
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
 
-st.set_page_config(page_title="Login + Settings + ZIP-Scan", layout="wide")
+st.set_page_config(page_title="Login + Admin + ZIP-Scan + Settings", layout="wide")
 
 # =========================================================
-#  DB-VERBINDUNG
+#  DB-Verbindung
 # =========================================================
 DB_URL = os.getenv("DATABASE_URL") or st.secrets.get("db", {}).get("url")
 if not DB_URL:
@@ -22,7 +23,7 @@ if not DB_URL:
 engine = create_engine(DB_URL, pool_pre_ping=True)
 
 # =========================================================
-#  SCHEMA / MIGRATION
+#  Schema / Migration
 # =========================================================
 with engine.begin() as conn:
     conn.execute(text("""
@@ -43,7 +44,7 @@ with engine.begin() as conn:
     """))
 
 # =========================================================
-#  AUTH-HELPER
+#  Auth-Helper
 # =========================================================
 def hash_password(pw: str) -> bytes:
     return bcrypt.hashpw(pw.encode("utf-8"), bcrypt.gensalt())
@@ -63,6 +64,40 @@ def get_user_hash(username: str):
     if not row: return None
     return _to_bytes(row[0])
 
+def get_user(username: str):
+    with engine.begin() as conn:
+        row = conn.execute(
+            text("SELECT username, role, must_change_password, created_at FROM users WHERE username=:u"),
+            {"u": username}
+        ).fetchone()
+    return dict(row._mapping) if row else None
+
+def needs_pw_reset(username: str) -> bool:
+    with engine.begin() as conn:
+        v = conn.execute(text("SELECT must_change_password FROM users WHERE username=:u"), {"u": username}).scalar()
+    return bool(v)
+
+def list_users():
+    with engine.begin() as conn:
+        rows = conn.execute(
+            text("SELECT username, role, must_change_password, created_at FROM users ORDER BY username")
+        ).fetchall()
+    return [dict(r._mapping) for r in rows]
+
+def set_user_role(username: str, role: str):
+    assert role in ("user","admin")
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE users SET role=:r WHERE username=:u"), {"r": role, "u": username})
+
+def set_user_password(username: str, new_pw: str, clear_flag=True):
+    with engine.begin() as conn:
+        if clear_flag:
+            conn.execute(text("UPDATE users SET pwd_hash=:h, must_change_password=FALSE WHERE username=:u"),
+                         {"h": hash_password(new_pw), "u": username})
+        else:
+            conn.execute(text("UPDATE users SET pwd_hash=:h WHERE username=:u"),
+                         {"h": hash_password(new_pw), "u": username})
+
 def add_user(username: str, password: str, role="user", must_change=True):
     try:
         with engine.begin() as conn:
@@ -74,6 +109,28 @@ def add_user(username: str, password: str, role="user", must_change=True):
         return True, "Benutzer angelegt."
     except IntegrityError:
         return False, "Benutzername existiert bereits."
+
+def delete_user(username: str):
+    # Sicheren Admin-Löschschutz (nicht selbst; nicht letzten Admin löschen)
+    me = st.session_state.get("user")
+    if username == me:
+        return False, "Du kannst dich nicht selbst löschen."
+    with engine.begin() as conn:
+        role_row = conn.execute(text("SELECT role FROM users WHERE username=:u"), {"u": username}).fetchone()
+        if not role_row:
+            return False, "Benutzer existiert nicht."
+        role = role_row[0]
+        if role == "admin":
+            count_admins = conn.execute(text("SELECT COUNT(*) FROM users WHERE role='admin'")).scalar()
+            if count_admins <= 1:
+                return False, "Letzten Admin darfst du nicht löschen."
+        conn.execute(text("DELETE FROM users WHERE username=:u"), {"u": username})
+    return True, "Benutzer gelöscht."
+
+def is_admin_current_user() -> bool:
+    u = st.session_state.get("user")
+    info = get_user(u) if u else None
+    return bool(info and info.get("role") == "admin")
 
 # Optionaler Seed-Admin (Env in Render setzen)
 SEED_ADMIN_USER = os.getenv("SEED_ADMIN_USER")
@@ -89,7 +146,7 @@ if SEED_ADMIN_USER and SEED_ADMIN_PASS:
             )
 
 # =========================================================
-#  SETTINGS (pro User)
+#  Settings (pro User)
 # =========================================================
 SETTINGS_KEY = "analyze_settings"
 
@@ -126,7 +183,7 @@ def get_settings():
     return st.session_state[SETTINGS_KEY]
 
 # =========================================================
-#  ANALYZER – nur L1(101..199)/L2(101..199), ZUORDNUNG: K1→SP4, K2→SP3
+#  Analyzer – nur L1(101..199)/L2(101..199); K1→Sp4, K2→Sp3
 # =========================================================
 def user_analyzer(root: Path) -> dict:
     """
@@ -160,7 +217,7 @@ def user_analyzer(root: Path) -> dict:
         for chan in ("1", "2"):
             fp = jobs[job_num].get(chan)
             if not fp: continue
-            spindle = 4 if chan == "1" else 3  # feste Logik, kein „Unzugeordnet“
+            spindle = 4 if chan == "1" else 3
             out["programs"].append({
                 "opName": f"Operation {fp.stem}",
                 "fileName": fp.name,
@@ -173,18 +230,16 @@ def user_analyzer(root: Path) -> dict:
                 "tool": {"toolName": "Tool", "cuttingEdgeNo": 1}
             })
 
-    # rowSyncs – pro Zeile
     out["rowSyncs"] = [{"rowNumber": i, "syncs": [[1, 2, 3]]} for i in range(1, len(sorted_jobs)+1)]
     return out
 
 # =========================================================
-#  PAGES
+#  Seiten
 # =========================================================
 def page_home():
     st.title("🏠 Home")
     st.markdown("### Programm auswählen (ZIP-Ordner hochladen)")
 
-    # Upload & Entpacken
     up = st.file_uploader("📦 ZIP hochladen", type=["zip"])
     if up:
         tmp = Path("/tmp") / f"user_{st.session_state.get('user','anon')}"
@@ -206,13 +261,10 @@ def page_home():
             return
 
     result = st.session_state.get("cam_result")
-    if not result:
-        return
-
+    if not result: return
     programs = result.get("programs", [])
     if not programs:
-        st.info("Keine Programme gefunden.")
-        return
+        st.info("Keine Programme gefunden."); return
 
     # Karten-Styles
     st.markdown("""
@@ -222,12 +274,12 @@ def page_home():
       .cardbox{min-height:84px;max-height:84px;display:flex;flex-direction:column;justify-content:center;}
     </style>""", unsafe_allow_html=True)
 
-    # nach rowNumber gruppieren
+    # Gruppieren nach rowNumber
     by_row = {}
     for p in programs:
         by_row.setdefault(p["position"]["rowNumber"], []).append(p)
 
-    # Kopfzeile: Spindel 4 | Spindel 3
+    # Kopf: Spindel 4 | Spindel 3
     c_idx, c_sp4, c_sp3 = st.columns([0.3, 2, 2])
     c_idx.markdown("<h3 style='text-align:center'>#</h3>", unsafe_allow_html=True)
     c_sp4.markdown("<h3 style='text-align:center'>🌀 Spindel 4</h3>", unsafe_allow_html=True)
@@ -276,6 +328,13 @@ def page_home():
         use_container_width=True
     )
 
+def page_auswertung():
+    st.title("📊 Auswertung")
+    st.info("Hier kannst du später Auswertungen/Reports auf Basis der camExportInfo.json einbauen.")
+    res = st.session_state.get("cam_result")
+    if res:
+        st.json(res)
+
 def page_settings():
     st.title("⚙️ Settings (pro Benutzer)")
     s = get_settings()
@@ -294,6 +353,89 @@ def page_settings():
         save_settings_to_db(st.session_state["user"], s)
         st.success("Settings gespeichert.")
 
+def page_admin():
+    st.title("🛠️ Admin – Benutzerverwaltung")
+    tabs = st.tabs(["👥 Benutzerliste", "➕ Benutzer anlegen (Temp-PW)"])
+
+    # Liste
+    with tabs[0]:
+        users = list_users()
+        if not users:
+            st.info("Keine Benutzer vorhanden.")
+        else:
+            for row in users:
+                col1, col2, col3, col4, col5, col6 = st.columns([3,2,3,3,3,2])
+                col1.write(f"**{row['username']}**")
+                col2.write(row['role'])
+                col3.write("🔁 Wechsel nötig" if row.get('must_change_password') else "✅ gesetzt")
+                col4.write(row.get('created_at'))
+
+                with col5:
+                    with st.popover("Passwort setzen (ohne Zwang)", use_container_width=True):
+                        new_pw = st.text_input(
+                            f"Neues Passwort für {row['username']}",
+                            type="password", key=f"pw_{row['username']}"
+                        )
+                        if st.button("Speichern", key=f"pwbtn_{row['username']}"):
+                            if new_pw:
+                                set_user_password(row['username'], new_pw, clear_flag=False)
+                                st.success("Passwort aktualisiert.")
+                            else:
+                                st.error("Bitte Passwort eingeben.")
+
+                with col6:
+                    if st.button("Löschen", key=f"del_inline_{row['username']}"):
+                        ok, msg = delete_user(row['username'])
+                        if ok:
+                            st.success(msg); st.rerun()
+                        else:
+                            st.warning(msg)
+
+            st.markdown("---")
+            st.subheader("Rolle ändern")
+            sel = st.selectbox("Benutzer", [u["username"] for u in users], key="role_sel_user")
+            role = st.radio("Rolle", ["user", "admin"], horizontal=True, key="role_sel_role")
+            if st.button("Rolle speichern", key="save_role_btn"):
+                if sel == st.session_state.get("user") and role != "admin":
+                    st.error("Du kannst dir nicht selbst Admin entziehen.")
+                else:
+                    set_user_role(sel, role); st.success("Rolle aktualisiert."); st.rerun()
+
+            st.markdown("---")
+            st.subheader("🗑️ Danger Zone – Benutzer löschen")
+            del_user = st.selectbox("Benutzer auswählen", [u["username"] for u in users], key="danger_del_user")
+            c1, c2 = st.columns([1, 3])
+            with c1:
+                confirm = st.checkbox("Ich bestätige das Löschen", key="danger_del_confirm")
+            with c2:
+                if st.button("Benutzer endgültig löschen", type="primary", key="danger_del_btn"):
+                    if not confirm:
+                        st.error("Bitte erst die Checkbox bestätigen.")
+                    else:
+                        ok, msg = delete_user(del_user)
+                        if ok: st.success(msg); st.rerun()
+                        else:  st.warning(msg)
+
+    # Neu anlegen (Temp-PW)
+    with tabs[1]:
+        st.info("Neuer Nutzer bekommt ein temporäres Passwort und muss es beim ersten Login ändern.")
+        nu = st.text_input("Benutzername (neu)", key="admin_new_user")
+        npw1 = st.text_input("Temporäres Passwort", type="password", key="admin_new_pw1")
+        npw2 = st.text_input("Temporäres Passwort (wiederholen)", type="password", key="admin_new_pw2")
+        nrole = st.radio("Rolle", ["user", "admin"], horizontal=True, index=0, key="admin_new_role")
+        if st.button("Benutzer erstellen", key="admin_create_user_btn"):
+            if not nu or not npw1:
+                st.error("Bitte Benutzername & Passwort eingeben.")
+            elif npw1 != npw2:
+                st.error("Passwörter stimmen nicht überein.")
+            else:
+                ok, msg = add_user(nu, npw1, nrole, must_change=True)
+                st.success(msg) if ok else st.error(msg)
+                if ok: st.rerun()
+
+# =========================================================
+#  Login / App
+# =========================================================
 def login_view():
     st.header("🔑 Login")
     u = st.text_input("Benutzername")
@@ -301,33 +443,39 @@ def login_view():
     if st.button("Einloggen"):
         h = get_user_hash(u)
         if h and check_password(p, h):
-            st.session_state.update(logged_in=True, user=u, page="Home")
+            st.session_state.update(logged_in=True, user=u, page="Home",
+                                    force_pw_change=needs_pw_reset(u))
             st.session_state[SETTINGS_KEY] = None
             get_settings()
             st.rerun()
         else:
             st.error("Ungültige Zugangsdaten.")
 
-# =========================================================
-#  APP
-# =========================================================
 def app():
-    if not st.session_state.get("logged_in"):
-        login_view()
-        return
+    st.session_state.setdefault("logged_in", False)
+    st.session_state.setdefault("page", "Home")
+
+    if not st.session_state["logged_in"]:
+        login_view(); return
 
     with st.sidebar:
-        choice = st.radio("Menü", ["Home", "Settings"])
+        st.title("🧭 Navigation")
+        menu = ["Home", "Auswertung", "Settings"]
+        if is_admin_current_user(): menu.append("Admin")
+        choice = st.radio("Menü", options=menu,
+                          index=menu.index(st.session_state["page"]) if st.session_state["page"] in menu else 0,
+                          label_visibility="collapsed")
         st.session_state["page"] = choice
         st.markdown("---")
-        st.caption(f"Eingeloggt als **{st.session_state.get('user','?')}**")
+        st.caption(f"Eingeloggt als **{st.session_state['user']}**")
         if st.button("Logout"):
             st.session_state.clear(); st.rerun()
 
-    if st.session_state["page"] == "Home":
-        page_home()
-    elif st.session_state["page"] == "Settings":
-        page_settings()
+    if st.session_state["page"] == "Home": page_home()
+    elif st.session_state["page"] == "Auswertung": page_auswertung()
+    elif st.session_state["page"] == "Settings": page_settings()
+    elif st.session_state["page"] == "Admin" and is_admin_current_user(): page_admin()
+    else: st.error("Seite nicht verfügbar.")
 
 if __name__ == "__main__":
     app()
