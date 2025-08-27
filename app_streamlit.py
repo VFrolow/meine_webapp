@@ -1,11 +1,10 @@
 # main.py
 import os
 import json
-import time
 import re
 import shutil
-import bcrypt
 import zipfile
+import bcrypt
 import streamlit as st
 from pathlib import Path
 from sqlalchemy import create_engine, text
@@ -14,7 +13,7 @@ from sqlalchemy.exc import IntegrityError
 st.set_page_config(page_title="Login + Settings + ZIP-Scan", layout="wide")
 
 # =========================================================
-#  DB-Verbindung
+#  DB-VERBINDUNG
 # =========================================================
 DB_URL = os.getenv("DATABASE_URL") or st.secrets.get("db", {}).get("url")
 if not DB_URL:
@@ -23,7 +22,7 @@ if not DB_URL:
 engine = create_engine(DB_URL, pool_pre_ping=True)
 
 # =========================================================
-#  Schema / Migration
+#  SCHEMA / MIGRATION
 # =========================================================
 with engine.begin() as conn:
     conn.execute(text("""
@@ -44,7 +43,7 @@ with engine.begin() as conn:
     """))
 
 # =========================================================
-#  Auth-Helper
+#  AUTH-HELPER
 # =========================================================
 def hash_password(pw: str) -> bytes:
     return bcrypt.hashpw(pw.encode("utf-8"), bcrypt.gensalt())
@@ -64,11 +63,6 @@ def get_user_hash(username: str):
     if not row: return None
     return _to_bytes(row[0])
 
-def needs_pw_reset(username: str) -> bool:
-    with engine.begin() as conn:
-        v = conn.execute(text("SELECT must_change_password FROM users WHERE username=:u"), {"u": username}).scalar()
-    return bool(v)
-
 def add_user(username: str, password: str, role="user", must_change=True):
     try:
         with engine.begin() as conn:
@@ -79,7 +73,7 @@ def add_user(username: str, password: str, role="user", must_change=True):
             )
         return True, "Benutzer angelegt."
     except IntegrityError:
-        return False, "Benutzer existiert bereits."
+        return False, "Benutzername existiert bereits."
 
 # Optionaler Seed-Admin (Env in Render setzen)
 SEED_ADMIN_USER = os.getenv("SEED_ADMIN_USER")
@@ -95,7 +89,7 @@ if SEED_ADMIN_USER and SEED_ADMIN_PASS:
             )
 
 # =========================================================
-#  Settings (pro User)
+#  SETTINGS (pro User)
 # =========================================================
 SETTINGS_KEY = "analyze_settings"
 
@@ -132,11 +126,14 @@ def get_settings():
     return st.session_state[SETTINGS_KEY]
 
 # =========================================================
-#  Analyzer – nur L1(101..199)/L2(101..199), rowSyncs=[[1,2,3]]
+#  ANALYZER – nur L1(101..199)/L2(101..199), ZUORDNUNG: K1→SP4, K2→SP3
 # =========================================================
 def user_analyzer(root: Path) -> dict:
     """
     Berücksichtigt NUR Programme L1(101..199) / L2(101..199), z. B. L1101, L2101, ...
+    Spindel-Zuordnung (ohne Mittelspalte/Manuell):
+      Kanal 1 → Spindel 4
+      Kanal 2 → Spindel 3
     """
     out = {"programs": [], "rowSyncs": []}
     rx_progname = re.compile(r'^L([12])(1\d{2})(?:\.[A-Za-z0-9]+)?$', re.IGNORECASE)
@@ -163,41 +160,31 @@ def user_analyzer(root: Path) -> dict:
         for chan in ("1", "2"):
             fp = jobs[job_num].get(chan)
             if not fp: continue
+            spindle = 4 if chan == "1" else 3  # feste Logik, kein „Unzugeordnet“
             out["programs"].append({
                 "opName": f"Operation {fp.stem}",
                 "fileName": fp.name,
                 "id": f"prog_{fp.name}",
                 "position": {
                     "rowNumber": row_nr,
-                    "spindleNumber": 0,                # unzugeordnet als Start
+                    "spindleNumber": spindle,
                     "channelNumber": int(chan)
                 },
                 "tool": {"toolName": "Tool", "cuttingEdgeNo": 1}
             })
 
+    # rowSyncs – pro Zeile
     out["rowSyncs"] = [{"rowNumber": i, "syncs": [[1, 2, 3]]} for i in range(1, len(sorted_jobs)+1)]
     return out
 
 # =========================================================
-#  Helper für horizontales Verschieben in der UI
-# =========================================================
-def reassign_spindle(pid, fname, new_spindle):
-    res = st.session_state.get("cam_result")
-    if not res: return
-    for p in res.get("programs", []):
-        if p.get("id") == pid and p.get("fileName") == fname:
-            p["position"]["spindleNumber"] = int(new_spindle)
-            break
-    st.session_state["cam_result"] = res
-
-# =========================================================
-#  Pages
+#  PAGES
 # =========================================================
 def page_home():
     st.title("🏠 Home")
     st.markdown("### Programm auswählen (ZIP-Ordner hochladen)")
 
-    # Upload & Entpacken (sauber mit rmtree)
+    # Upload & Entpacken
     up = st.file_uploader("📦 ZIP hochladen", type=["zip"])
     if up:
         tmp = Path("/tmp") / f"user_{st.session_state.get('user','anon')}"
@@ -227,7 +214,7 @@ def page_home():
         st.info("Keine Programme gefunden.")
         return
 
-    # Karten-Styles (inkl. Tooltip per title-Attribut)
+    # Karten-Styles
     st.markdown("""
     <style>
       .sm-title{font-weight:600;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin:0;}
@@ -240,48 +227,45 @@ def page_home():
     for p in programs:
         by_row.setdefault(p["position"]["rowNumber"], []).append(p)
 
-    # Kopf (Sp4 | Mitte | Sp3)
-    c_idx, c_sp4, c_mid, c_sp3 = st.columns([0.3, 2, 1.2, 2])
+    # Kopfzeile: Spindel 4 | Spindel 3
+    c_idx, c_sp4, c_sp3 = st.columns([0.3, 2, 2])
     c_idx.markdown("<h3 style='text-align:center'>#</h3>", unsafe_allow_html=True)
     c_sp4.markdown("<h3 style='text-align:center'>🌀 Spindel 4</h3>", unsafe_allow_html=True)
-    c_mid.markdown("<h3 style='text-align:center'>Unzugeordnet</h3>", unsafe_allow_html=True)
     c_sp3.markdown("<h3 style='text-align:center'>🌀 Spindel 3</h3>", unsafe_allow_html=True)
 
+    # Unterzeile: Kanäle
+    c_idx, c_sp4_k1, c_sp4_k2, c_sp3_k1, c_sp3_k2 = st.columns([0.3, 1, 1, 1, 1])
+    c_sp4_k1.markdown("<h4 style='text-align:center'>Kanal 1</h4>", unsafe_allow_html=True)
+    c_sp4_k2.markdown("<h4 style='text-align:center'>Kanal 2</h4>", unsafe_allow_html=True)
+    c_sp3_k1.markdown("<h4 style='text-align:center'>Kanal 1</h4>", unsafe_allow_html=True)
+    c_sp3_k2.markdown("<h4 style='text-align:center'>Kanal 2</h4>", unsafe_allow_html=True)
+
+    # Renderer
+    def render_card(col, op):
+        opn = (op["opName"] or "").strip()
+        tool = (op["tool"]["toolName"] or "").strip()
+        with col.container(border=True):
+            st.markdown(
+                f"<div class='cardbox'><p class='sm-title' title='{opn}'>{opn}</p>"
+                f"<p class='sm-sub' title='{tool}'>🛠️ {tool}</p></div>",
+                unsafe_allow_html=True
+            )
+
+    # Zeilen darstellen
     for idx, row_nr in enumerate(sorted(by_row.keys()), start=1):
         row = by_row[row_nr]
-        sp4 = [p for p in row if p["position"]["spindleNumber"] == 4]
-        mid = [p for p in row if p["position"]["spindleNumber"] == 0]
-        sp3 = [p for p in row if p["position"]["spindleNumber"] == 3]
+        sp4_k1 = [p for p in row if p["position"]["spindleNumber"] == 4 and p["position"]["channelNumber"] == 1]
+        sp4_k2 = [p for p in row if p["position"]["spindleNumber"] == 4 and p["position"]["channelNumber"] == 2]
+        sp3_k1 = [p for p in row if p["position"]["spindleNumber"] == 3 and p["position"]["channelNumber"] == 1]
+        sp3_k2 = [p for p in row if p["position"]["spindleNumber"] == 3 and p["position"]["channelNumber"] == 2]
 
-        c_idx, c1, cM, c3 = st.columns([0.3, 2, 1.2, 2])
+        c_idx, c1, c2, c3, c4 = st.columns([0.3, 1, 1, 1, 1])
         c_idx.markdown(f"<div style='text-align:center;font-weight:bold;margin-top:20px'>{idx}</div>", unsafe_allow_html=True)
 
-        def render_card(col, op, where: str):
-            opn = (op["opName"] or "").strip()
-            tool = (op["tool"]["toolName"] or "").strip()
-            pid, fname = op["id"], op["fileName"]
-            with col.container(border=True):
-                st.markdown(
-                    f"<div class='cardbox'><p class='sm-title' title='{opn}'>{opn}</p>"
-                    f"<p class='sm-sub' title='{tool}'>🛠️ {tool}</p></div>",
-                    unsafe_allow_html=True
-                )
-                if where == "mid":
-                    cl, cr = st.columns(2)
-                    if cl.button("← nach Spindel 4", key=f"to4_{pid}_{fname}"):
-                        reassign_spindle(pid, fname, 4); st.rerun()
-                    if cr.button("nach Spindel 3 →", key=f"to3_{pid}_{fname}"):
-                        reassign_spindle(pid, fname, 3); st.rerun()
-                elif where == "sp4":
-                    if st.button("nach Spindel 3 →", key=f"to3_{pid}_{fname}"):
-                        reassign_spindle(pid, fname, 3); st.rerun()
-                elif where == "sp3":
-                    if st.button("← nach Spindel 4", key=f"to4_{pid}_{fname}"):
-                        reassign_spindle(pid, fname, 4); st.rerun()
-
-        for op in sp4: render_card(c1, op, "sp4")
-        for op in mid: render_card(cM, op, "mid")
-        for op in sp3: render_card(c3, op, "sp3")
+        for op in sp4_k1: render_card(c1, op)
+        for op in sp4_k2: render_card(c2, op)
+        for op in sp3_k1: render_card(c3, op)
+        for op in sp3_k2: render_card(c4, op)
 
     st.markdown("---")
     st.download_button(
@@ -317,8 +301,7 @@ def login_view():
     if st.button("Einloggen"):
         h = get_user_hash(u)
         if h and check_password(p, h):
-            st.session_state.update(logged_in=True, user=u, page="Home",
-                                    force_pw_change=needs_pw_reset(u))
+            st.session_state.update(logged_in=True, user=u, page="Home")
             st.session_state[SETTINGS_KEY] = None
             get_settings()
             st.rerun()
@@ -326,7 +309,7 @@ def login_view():
             st.error("Ungültige Zugangsdaten.")
 
 # =========================================================
-#  App
+#  APP
 # =========================================================
 def app():
     if not st.session_state.get("logged_in"):
